@@ -4,6 +4,7 @@ import { ExternalLink, X } from "lucide-react";
 import { useRef } from "react";
 import { useGetSettingsQuery } from "@/app/api/queries/useGetSettingsQuery";
 import type { ToolCallResult } from "@/app/chat/_types/types";
+import { HighlightedText } from "@/components/highlighted-text";
 import { PopoverContent } from "@/components/ui/popover";
 import { DEFAULT_KNOWLEDGE_SETTINGS } from "@/lib/constants";
 
@@ -13,7 +14,10 @@ interface ChunkPopupProps {
   filename: string;
   score: number | string;
   sourceText: string;
+  /** Highlight fragments from OpenSearch (optional — pure KNN hits omit this). */
+  highlights?: string[];
   item: ToolCallResult;
+  showViewDocument?: boolean;
 }
 
 const getMetadataValue = (
@@ -102,12 +106,14 @@ export function ChunkPopup({
   filename,
   score,
   sourceText,
+  highlights,
   item,
+  showViewDocument = true,
 }: ChunkPopupProps) {
   const { data: settings } = useGetSettingsQuery();
   const closeButtonRef = useRef<HTMLButtonElement>(null);
 
-  const hasUrl = !!item.source_url;
+  const hasUrl = showViewDocument && !!item.source_url;
   const parser = formatParser(item, filename);
   const scoreLabel = formatScore(item, score);
   const pageLabel = formatPage(item);
@@ -211,7 +217,10 @@ export function ChunkPopup({
             </div>
           </div>
           <div className="bg-background/40 text-xs text-foreground p-4 rounded-lg border border-border leading-relaxed font-normal whitespace-pre-wrap select-text max-h-72 overflow-y-auto">
-            {sourceText}
+            <HighlightedText
+              highlights={highlights ?? []}
+              fallbackText={sourceText}
+            />
           </div>
         </div>
       </div>

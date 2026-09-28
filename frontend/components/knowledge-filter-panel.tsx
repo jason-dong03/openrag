@@ -5,16 +5,11 @@ import { useEffect, useRef, useState } from "react";
 import { useCreateFilter } from "@/app/api/mutations/useCreateFilter";
 import { useDeleteFilter } from "@/app/api/mutations/useDeleteFilter";
 import { useUpdateFilter } from "@/app/api/mutations/useUpdateFilter";
-import { useGetSearchAggregations } from "@/app/api/queries/useGetSearchAggregations";
 import {
-  EMPTY_SEARCH_RESULT,
-  useGetSearchQuery,
-} from "@/app/api/queries/useGetSearchQuery";
-import {
-  type FilterColor,
-  FilterIconPopover,
-  type IconKey,
-} from "@/components/filter-icon-popover";
+  type FacetBucket,
+  useGetSearchAggregations,
+} from "@/app/api/queries/useGetSearchAggregations";
+import { FilterIconPopover } from "@/components/filter-icon-popover";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -29,18 +24,9 @@ import { MultiSelect } from "@/components/ui/multi-select";
 import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
 import { useKnowledgeFilter } from "@/contexts/knowledge-filter-context";
-import { useTask } from "@/contexts/task-context";
 import { usePermissions } from "@/hooks/use-permissions";
 import { trackButton } from "@/lib/analytics";
-import {
-  buildActiveSourceOptions,
-  buildKnowledgeTableRows,
-} from "@/lib/knowledge-table-state";
-
-interface FacetBucket {
-  key: string;
-  count: number;
-}
+import type { FilterColor, IconKey } from "@/lib/filter-constants";
 
 interface AvailableFacets {
   data_sources: FacetBucket[];
@@ -69,6 +55,13 @@ const formatDate = (dateString: string) => {
   });
 };
 
+const formatFacetLabel = (bucket: FacetBucket) => {
+  const displayValue = bucket.label ?? bucket.key;
+  return typeof bucket.count === "number"
+    ? `${displayValue} (${bucket.count})`
+    : displayValue;
+};
+
 export function KnowledgeFilterPanel() {
   const {
     queryOverride,
@@ -80,7 +73,6 @@ export function KnowledgeFilterPanel() {
     createMode,
     endCreateMode,
   } = useKnowledgeFilter();
-  const { files: taskFiles } = useTask();
   const deleteFilterMutation = useDeleteFilter();
   const updateFilterMutation = useUpdateFilter();
   const createFilterMutation = useCreateFilter();
@@ -118,6 +110,7 @@ export function KnowledgeFilterPanel() {
   // Load current filter data into controls when a filter is selected
   useEffect(() => {
     if (selectedFilter && parsedFilterData) {
+      setNameError(null);
       setQuery(parsedFilterData.query || "");
 
       // Set the actual filter selections from the saved knowledge filter
@@ -146,6 +139,7 @@ export function KnowledgeFilterPanel() {
   // Initialize defaults when entering create mode
   useEffect(() => {
     if (createMode && parsedFilterData) {
+      setNameError(null);
       setQuery(parsedFilterData.query || "");
       // Provide defaults for missing filter fields
       const filters = parsedFilterData.filters || {};
@@ -168,28 +162,31 @@ export function KnowledgeFilterPanel() {
   const { data: aggregations } = useGetSearchAggregations("*", 1, 0, {
     enabled: isPanelOpen,
     placeholderData: (prev) => prev,
-    staleTime: 60_000,
+    staleTime: 0,
     gcTime: 5 * 60_000,
   });
 
-  const { data = EMPTY_SEARCH_RESULT } = useGetSearchQuery("*", null, {
-    enabled: isPanelOpen,
-  });
-  const allSearchData = data.files;
-
   useEffect(() => {
     if (!aggregations) return;
+    const extractBuckets = (buckets: FacetBucket[] = []): FacetBucket[] =>
+      buckets.map((bucket) => ({
+        key: bucket.key,
+        label: bucket.label,
+        count: bucket.doc_count ?? bucket.count,
+      }));
     const facets = {
-      data_sources: aggregations.data_sources?.buckets || [],
-      document_types: aggregations.document_types?.buckets || [],
-      owners: aggregations.owners?.buckets || [],
-      connector_types: aggregations.connector_types?.buckets || [],
+      data_sources: extractBuckets(aggregations.data_sources?.buckets),
+      document_types: extractBuckets(aggregations.document_types?.buckets),
+      owners: extractBuckets(aggregations.owners?.buckets),
+      connector_types: extractBuckets(aggregations.connector_types?.buckets),
     };
     setAvailableFacets(facets);
   }, [aggregations]);
 
-  const tableRows = buildKnowledgeTableRows(allSearchData, taskFiles);
-  const sourceOptions = buildActiveSourceOptions(tableRows);
+  const sourceOptions = (availableFacets.data_sources || []).map((bucket) => ({
+    value: bucket.key,
+    label: formatFacetLabel(bucket),
+  }));
   const availableSourceValues = new Set(sourceOptions.map((o) => o.value));
 
   // Don't render if panel is closed or we don't have any data
@@ -326,18 +323,19 @@ export function KnowledgeFilterPanel() {
                 />
               </div>
             </div>
-            {!createMode && selectedFilter?.created_at && (
-              <div className="space-y-2 text-xs text-right text-muted-foreground">
-                <span className="text-placeholder-foreground">Created</span>{" "}
-                {formatDate(selectedFilter.created_at)}
-              </div>
-            )}
-            {createMode && (
-              <div className="space-y-2 text-xs text-right text-muted-foreground">
-                <span className="text-placeholder-foreground">Created</span>{" "}
-                {formatDate(new Date().toISOString())}
-              </div>
-            )}
+            <div className="text-xs min-h-[1.25rem]">
+              {nameError ? (
+                <span className="text-destructive">{nameError}</span>
+              ) : (
+                !createMode &&
+                selectedFilter?.created_at && (
+                  <span className="text-muted-foreground">
+                    <span className="text-placeholder-foreground">Created</span>{" "}
+                    {formatDate(selectedFilter.created_at)}
+                  </span>
+                )
+              )}
+            </div>
             <div className="space-y-2">
               <Label htmlFor="filter-description">Description</Label>
               <Textarea
@@ -391,8 +389,7 @@ export function KnowledgeFilterPanel() {
                 options={(availableFacets.document_types || []).map(
                   (bucket) => ({
                     value: bucket.key,
-                    label: bucket.key,
-                    count: bucket.count,
+                    label: formatFacetLabel(bucket),
                   }),
                 )}
                 value={selectedFilters.document_types}
@@ -408,8 +405,7 @@ export function KnowledgeFilterPanel() {
               <MultiSelect
                 options={(availableFacets.owners || []).map((bucket) => ({
                   value: bucket.key,
-                  label: bucket.key,
-                  count: bucket.count,
+                  label: formatFacetLabel(bucket),
                 }))}
                 value={selectedFilters.owners}
                 onValueChange={(values) => handleFilterChange("owners", values)}
@@ -423,8 +419,7 @@ export function KnowledgeFilterPanel() {
                 options={(availableFacets.connector_types || []).map(
                   (bucket) => ({
                     value: bucket.key,
-                    label: bucket.key,
-                    count: bucket.count,
+                    label: formatFacetLabel(bucket),
                   }),
                 )}
                 value={selectedFilters.connector_types}
@@ -501,7 +496,6 @@ export function KnowledgeFilterPanel() {
           </div>
         </CardContent>
         <CardFooter className="mt-auto align-bottom justify-end gap-2">
-          {/* Save Configuration Button */}
           {createMode && (
             <Button
               onClick={closePanelOnly}

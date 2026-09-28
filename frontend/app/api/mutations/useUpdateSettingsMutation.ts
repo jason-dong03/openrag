@@ -3,6 +3,7 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
+import { formatProviderErrorMessage } from "@/lib/chat-stream-errors";
 import { useGetCurrentProviderModelsQuery } from "../queries/useGetModelsQuery";
 import type { Settings } from "../queries/useGetSettingsQuery";
 
@@ -52,6 +53,10 @@ export interface UpdateSettingsRequest {
   remove_watsonx_config?: boolean;
   // Bypass the "this provider's embedding models are still in use" guard.
   force_remove?: boolean;
+  provider_credentials?: Record<string, Record<string, string>>;
+  provider_credential_removals?: Record<string, string[]>;
+  provider_auth_methods?: Record<string, string>;
+  remove_provider_config?: string;
 }
 
 export interface AffectedEmbeddingModel {
@@ -69,9 +74,9 @@ class UpdateSettingsError extends Error {
   readonly affectedModels?: AffectedEmbeddingModel[];
 
   constructor(status: number, data: Record<string, unknown>) {
-    const message =
+    const raw =
       typeof data.error === "string" ? data.error : "Failed to update settings";
-    super(message);
+    super(formatProviderErrorMessage(raw));
     this.name = "UpdateSettingsError";
     this.status = status;
     this.code = typeof data.code === "string" ? data.code : undefined;

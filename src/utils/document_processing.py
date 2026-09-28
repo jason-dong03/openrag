@@ -5,6 +5,8 @@ from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+IMAGE_PLACEHOLDER = "<!-- image -->"
+
 
 def process_text_file(file_path: str) -> dict:
     """
@@ -82,6 +84,8 @@ def extract_relevant(doc_dict: dict) -> dict:
       - Finds every text fragment in `texts`, groups them by page_no
       - Flattens tables in `tables` into tab-separated text, grouping by row
       - Concatenates each page's fragments and each table into its own chunk
+      - Emits a picture chunk for each picture with description annotations
+      - Emits one image placeholder only when pictures exist and no other chunks were produced
     Returns a slimmed dict ready for indexing, with each chunk under "text".
     """
     origin = doc_dict.get("origin", {})
@@ -131,6 +135,48 @@ def extract_relevant(doc_dict: dict) -> dict:
             }
         )
 
+    # 3) process picture descriptions (VLM-generated annotations)
+    # Docling stores these under pictures[].annotations with kind == "description".
+    # Without this, image-only documents (no text layer) yield zero chunks on the
+    # non-Langflow path, which surfaces as a misleading "corrupted or invalid" error.
+    # The Langflow path already captures them via Docling's export_to_markdown.
+    pictures = doc_dict.get("pictures", [])
+    for p_idx, picture in enumerate(pictures):
+        prov = picture.get("prov", [])
+        page_no = prov[0].get("page_no") if prov else None
+        if page_no is None:
+            page_no = 1
+
+        descriptions = [
+            ann.get("text", "").strip()
+            for ann in picture.get("annotations", [])
+            if ann.get("kind") == "description" and ann.get("text", "").strip()
+        ]
+        if descriptions:
+            chunks.append(
+                {
+                    "page": page_no,
+                    "type": "picture",
+                    "picture_index": p_idx,
+                    "text": "\n".join(descriptions),
+                }
+            )
+
+    # Preserve a non-empty signal for image-only documents without descriptions,
+    # but avoid embedding one identical placeholder for every uncaptioned picture.
+    if not chunks and pictures:
+        first_picture = pictures[0]
+        prov = first_picture.get("prov", [])
+        page_no = prov[0].get("page_no") if prov else None
+        chunks.append(
+            {
+                "page": page_no if page_no is not None else 1,
+                "type": "picture",
+                "picture_index": 0,
+                "text": IMAGE_PLACEHOLDER,
+            }
+        )
+
     return {
         "id": origin.get("binary_hash"),
         "filename": origin.get("filename"),
@@ -161,6 +207,12 @@ def resplit_chunks_character_windows(
         text = ch.get("text") if isinstance(ch, dict) else None
         if not isinstance(text, str):
             out.append(dict(ch) if isinstance(ch, dict) else ch)
+            continue
+        # This marker is a semantic signal that Docling detected an image even
+        # though it extracted no text. Keep it intact so image-only documents
+        # remain ingestible and display the same placeholder as the Langflow path.
+        if text.strip() == IMAGE_PLACEHOLDER:
+            out.append(dict(ch))
             continue
         if len(text) <= chunk_size:
             out.append(dict(ch))

@@ -26,7 +26,8 @@ export interface ProviderHealthResponse {
 }
 
 export interface ProviderHealthParams {
-  provider?: "openai" | "ollama" | "watsonx";
+  /** Any provider key recognised by the backend's LiteLLM catalogue. */
+  provider?: string;
   test_completion?: boolean;
 }
 
@@ -66,13 +67,12 @@ export const useProviderHealthQuery = (
     try {
       const url = new URL("/api/provider/health", window.location.origin);
 
-      // Add provider query param if specified
       if (params?.provider) {
         url.searchParams.set("provider", params.provider);
       }
 
-      // Add test_completion query param if specified or if chat error exists
-      // Use the same testCompletion value that's in the queryKey
+      // After chat/ingest failure, run a completion check so the banner shows
+      // the real cause (disabled key vs missing model). Otherwise lightweight.
       const testCompletion = params?.test_completion ?? hasChatError;
       if (testCompletion) {
         url.searchParams.set("test_completion", "true");
@@ -81,9 +81,12 @@ export const useProviderHealthQuery = (
       const response = await fetch(url.toString());
 
       if (response.ok) {
-        return await response.json();
+        const data = (await response.json()) as ProviderHealthResponse;
+        if (hasChatError) {
+          setChatError(false);
+        }
+        return data;
       } else if (response.status === 503) {
-        // Backend is up but provider validation failed
         const errorData = await response.json().catch(() => ({}));
         return {
           status: "unhealthy",
@@ -96,7 +99,6 @@ export const useProviderHealthQuery = (
           details: errorData.details,
         };
       } else {
-        // Other backend errors (400, etc.) - treat as provider issues
         const errorData = await response.json().catch(() => ({}));
         return {
           status: "error",
@@ -110,7 +112,6 @@ export const useProviderHealthQuery = (
         };
       }
     } catch (error) {
-      // Network error - backend is likely down, don't show provider banner
       return {
         status: "backend-unavailable",
         message: error instanceof Error ? error.message : "Connection failed",
@@ -119,59 +120,57 @@ export const useProviderHealthQuery = (
     }
   }
 
-  // Include hasChatError in queryKey so React Query refetches when it changes
-  // This ensures the health check runs with test_completion=true when chat errors occur
+  // hasChatError in the key forces an immediate refetch when chat/ingest fails.
   const testCompletion = params?.test_completion ?? hasChatError;
   const queryKey = ["provider", "health", testCompletion, hasChatError];
   const failureCountKey = queryKey.join("-");
 
-  return useQuery(
+  const isEnabled =
+    !!settings?.edited &&
+    isOnboardingComplete &&
+    !hasActiveIngestion &&
+    providerHealthAllowed &&
+    options?.enabled !== false;
+
+  const query = useQuery(
     {
       queryKey,
       queryFn: checkProviderHealth,
-      retry: false, // Don't retry health checks automatically
+      retry: false,
       refetchInterval: (query) => {
         const data = query.state.data;
         const status = data?.status;
 
-        // If healthy, reset failure count and check every 30 seconds
-        // Also reset chat error flag if we're using test_completion=true and it succeeded
         if (status === "healthy") {
           failureCountMap.set(failureCountKey, 0);
-          // If we were checking with test_completion=true due to chat errors, reset the flag
-          if (hasChatError && setChatError) {
-            setChatError(false);
-          }
           return 30000;
         }
 
-        // If backend unavailable, use moderate polling
         if (status === "backend-unavailable") {
           return 15000;
         }
 
-        // For unhealthy/error status, use exponential backoff
+        // Keep probing while latched so fixing the real cause updates the banner
+        // within seconds (key re-enable or model change).
+        if (hasChatError) {
+          return 5000;
+        }
+
         const currentFailures = failureCountMap.get(failureCountKey) || 0;
         failureCountMap.set(failureCountKey, currentFailures + 1);
-
-        // Exponential backoff: 5s, 10s, 20s, then 30s
         const backoffDelays = [5000, 10000, 20000, 30000];
-        const delay =
-          backoffDelays[Math.min(currentFailures, backoffDelays.length - 1)];
-
-        return delay;
+        return backoffDelays[
+          Math.min(currentFailures, backoffDelays.length - 1)
+        ];
       },
-      refetchOnWindowFocus: false, // Disabled to reduce unnecessary calls on tab switches
+      refetchOnWindowFocus: false,
       refetchOnMount: true,
-      staleTime: 30000, // Consider data stale after 30 seconds
-      enabled:
-        !!settings?.edited &&
-        isOnboardingComplete &&
-        !hasActiveIngestion && // Disable health checks when ingestion is happening
-        providerHealthAllowed && // Admin-only under enforced RBAC
-        options?.enabled !== false, // Only run after onboarding is complete
+      staleTime: 30000,
       ...options,
+      enabled: isEnabled,
     },
     queryClient,
   );
+
+  return { ...query, isEnabled };
 };

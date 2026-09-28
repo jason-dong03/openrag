@@ -13,6 +13,10 @@ endif
 
 hostname ?= 0.0.0.0
 
+# Environment variables that must be non-empty in .env for dev targets to work.
+# Add new vars here as they become required.
+REQUIRED_ENV_VARS := LANGFLOW_SUPERUSER LANGFLOW_SUPERUSER_PASSWORD OPENSEARCH_PASSWORD LANGFLOW_SECRET_KEY
+
 # Default values for dev-branch builds (can be overridden via command line)
 # Usage: make dev-branch BRANCH=test-openai-responses REPO=https://github.com/myorg/langflow.git
 BRANCH ?= main
@@ -100,12 +104,13 @@ endef
 .PHONY: help check_tools help_docker help_dev help_test help_local help_utils help_operator \
        dev dev-cpu dev-local dev-local-cpu dev-local-build-lf dev-local-build-lf-cpu stop clean build logs \
        azurite-up azurite-down \
+       instana-agent-up instana-agent-down \
        shell-backend shell-frontend install \
        test test-unit test-integration test-ci test-ci-local test-ci-suite test-sdk test-os-jwt lint \
        ci-build-images ci-save-images \
        backend frontend docling docling-stop install-be install-fe build-be build-fe build-os build-lf logs-be logs-fe logs-lf logs-os \
        shell-be shell-lf shell-os restart status health db-reset clear-os-data flow-upload setup factory-reset \
-       dev-branch build-langflow-dev stop-dev clean-dev logs-dev logs-lf-dev shell-lf-dev restart-dev status-dev \
+       dev-branch dev-branch-cpu dev-branch-local dev-branch-local-cpu build-langflow-dev stop-dev clean-dev logs-dev logs-lf-dev shell-lf-dev restart-dev status-dev \
        ensure-langflow-data ensure-backend-volumes
 
 all: help
@@ -267,6 +272,9 @@ help_dev: ## Show development environment commands
 	@echo "  $(PURPLE)make dev-branch$(NC)      - Build & run with custom Langflow branch"
 	@echo "                         Usage: make dev-branch BRANCH=test-openai-responses"
 	@echo "                                make dev-branch BRANCH=feature-x REPO=https://github.com/org/langflow.git"
+	@echo "  $(PURPLE)make dev-branch-cpu$(NC)  - Build & run (CPU only) with custom Langflow branch"
+	@echo "  $(PURPLE)make dev-branch-local$(NC) - Start local infrastructure only with custom Langflow branch"
+	@echo "  $(PURPLE)make dev-branch-local-cpu$(NC) - Start local infrastructure only (CPU only) with custom Langflow branch"
 	@echo "  $(PURPLE)make build-langflow-dev$(NC) - Build only the Langflow dev image (no cache)"
 	@echo "  $(PURPLE)make stop-dev$(NC)        - Stop dev environment containers"
 	@echo "  $(PURPLE)make restart-dev$(NC)     - Restart dev environment"
@@ -353,6 +361,22 @@ help_local: ## Show local development commands
 	@echo "  $(PURPLE)make docling-stop$(NC)    - Stop docling-serve"
 	@echo "  $(PURPLE)make azurite-up$(NC)      - Start Azurite (local Azure Blob emulator) for connector testing"
 	@echo "  $(PURPLE)make azurite-down$(NC)    - Stop Azurite emulator"
+	@echo "  $(PURPLE)make instana-agent-up$(NC)   - Start the local Instana host agent (forwards to INSTANA_AGENT_ENDPOINT)"
+	@echo "  $(PURPLE)make instana-agent-down$(NC) - Stop the local Instana host agent"
+	@echo ''
+	@echo "$(PURPLE)Red Hat OpenShift AI (RHOAI) models:$(NC)"
+	@echo "  Set these in $(ENV_FILE); they are exported to $(CYAN)make backend$(NC) and passed"
+	@echo "  through to the backend container by $(CYAN)make dev$(NC) / $(CYAN)make dev-cpu$(NC)."
+	@echo "    $(CYAN)RHOAI_ENDPOINT$(NC)             - chat InferenceService URL, ending in /v1"
+	@echo "    $(CYAN)RHOAI_EMBEDDINGS_ENDPOINT$(NC)  - embedding InferenceService URL (vLLM serves one model each)"
+	@echo "    $(CYAN)RHOAI_API_KEY$(NC)              - ServiceAccount bearer token for both endpoints"
+	@echo "    $(CYAN)RHOAI_TLS_VERIFY$(NC)           - CA bundle path, or 'false' for a port-forward (dev only)"
+	@echo "  In-cluster, use the predictor Service DNS and the projected service CA:"
+	@echo "    $(CYAN)/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt$(NC)"
+	@echo "  From a laptop, port-forward each InferenceService and set RHOAI_TLS_VERIFY=false:"
+	@echo "    $(CYAN)oc port-forward -n <ns> svc/<isvc>-predictor 8443:8443$(NC)"
+	@echo "  The provider is hidden in every run mode until $(CYAN)OPENRAG_MODEL_PROVIDERS_CONFIG$(NC)"
+	@echo "  points at a model_providers.yaml enabling it (see .env.example)."
 	@echo ''
 	@echo "$(PURPLE)Installation:$(NC)"
 	@echo "  $(PURPLE)make install$(NC)         - Install all dependencies"
@@ -415,7 +439,74 @@ ensure-backend-volumes: ## Create and permission backend volume directories
 	@chmod 775 flows keys config data openrag-documents 2>/dev/null \
 		|| echo "$(YELLOW)Warning: Could not chmod backend volume directories.$(NC)"
 
-dev: ensure-langflow-data ensure-backend-volumes ## Start full stack with GPU support
+check-env: ## Verify required environment variables are set in .env
+	@missing=""; \
+	for var in $(REQUIRED_ENV_VARS); do \
+		val="$$(eval echo "\$$$$var")"; \
+		if [ -z "$$val" ]; then \
+			missing="$$missing $$var"; \
+		fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "$(RED)Error: the following required variables are missing or empty in $(ENV_FILE):$(NC)"; \
+		for var in $$missing; do \
+			echo "  - $$var"; \
+		done; \
+		echo ""; \
+		echo "$(YELLOW)Set them in $(ENV_FILE) and try again.$(NC)"; \
+		echo "Tip: 'make generate-langflow-password' can auto-generate Langflow credentials."; \
+		exit 1; \
+	fi; \
+	pw="$${OPENSEARCH_PASSWORD}"; \
+	pw_errors=""; \
+	if [ $${#pw} -lt 8 ]; then \
+		pw_errors="$$pw_errors\n  - at least 8 characters"; \
+	fi; \
+	if ! printf '%s' "$$pw" | grep -q '[A-Z]'; then \
+		pw_errors="$$pw_errors\n  - at least one uppercase letter"; \
+	fi; \
+	if ! printf '%s' "$$pw" | grep -q '[a-z]'; then \
+		pw_errors="$$pw_errors\n  - at least one lowercase letter"; \
+	fi; \
+	if ! printf '%s' "$$pw" | grep -q '[0-9]'; then \
+		pw_errors="$$pw_errors\n  - at least one digit"; \
+	fi; \
+	if ! printf '%s' "$$pw" | grep -q '[^A-Za-z0-9]'; then \
+		pw_errors="$$pw_errors\n  - at least one special character"; \
+	fi; \
+	if [ -n "$$pw_errors" ]; then \
+		echo "$(RED)Error: OPENSEARCH_PASSWORD does not meet the required policy:$(NC)"; \
+		printf "$$pw_errors\n"; \
+		echo ""; \
+		echo "$(YELLOW)Update OPENSEARCH_PASSWORD in $(ENV_FILE) and try again.$(NC)"; \
+		exit 1; \
+	fi
+
+generate-langflow-password: ## Auto-generate and append Langflow superuser credentials to .env
+	@PW=$$(openssl rand -base64 24 | tr -d '/+=' | head -c 24) || \
+		{ echo "$(RED)Error: failed to generate password$(NC)"; exit 1; }; \
+	if [ -z "$$PW" ]; then \
+		echo "$(RED)Error: generated password is empty$(NC)"; exit 1; \
+	fi; \
+	if grep -q '^LANGFLOW_SUPERUSER=' "$(ENV_FILE)" 2>/dev/null; then \
+		sed -i.bak "s/^LANGFLOW_SUPERUSER=.*/LANGFLOW_SUPERUSER='admin'/" "$(ENV_FILE)" && rm -f "$(ENV_FILE).bak" || \
+			{ rm -f "$(ENV_FILE).bak"; echo "$(RED)Error: failed to update LANGFLOW_SUPERUSER in $(ENV_FILE)$(NC)"; exit 1; }; \
+	else \
+		echo "LANGFLOW_SUPERUSER='admin'" >> "$(ENV_FILE)" || \
+			{ echo "$(RED)Error: failed to append LANGFLOW_SUPERUSER to $(ENV_FILE)$(NC)"; exit 1; }; \
+	fi; \
+	if grep -q '^LANGFLOW_SUPERUSER_PASSWORD=' "$(ENV_FILE)" 2>/dev/null; then \
+		sed -i.bak "s/^LANGFLOW_SUPERUSER_PASSWORD=.*/LANGFLOW_SUPERUSER_PASSWORD='$$PW'/" "$(ENV_FILE)" && rm -f "$(ENV_FILE).bak" || \
+			{ rm -f "$(ENV_FILE).bak"; echo "$(RED)Error: failed to update LANGFLOW_SUPERUSER_PASSWORD in $(ENV_FILE)$(NC)"; exit 1; }; \
+	else \
+		echo "LANGFLOW_SUPERUSER_PASSWORD='$$PW'" >> "$(ENV_FILE)" || \
+			{ echo "$(RED)Error: failed to append LANGFLOW_SUPERUSER_PASSWORD to $(ENV_FILE)$(NC)"; exit 1; }; \
+	fi; \
+	echo "$(GREEN)Langflow superuser credentials written to $(ENV_FILE)$(NC)"; \
+	echo "  LANGFLOW_SUPERUSER=admin"; \
+	echo "  LANGFLOW_SUPERUSER_PASSWORD=$$PW"
+
+dev: ensure-langflow-data ensure-backend-volumes check-env ## Start full stack with GPU support
 	@echo "$(YELLOW)Starting OpenRAG with GPU support...$(NC)"
 	$(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.gpu.yml up -d
 	@echo "$(PURPLE)Services started!$(NC)"
@@ -425,7 +516,7 @@ dev: ensure-langflow-data ensure-backend-volumes ## Start full stack with GPU su
 	@echo "   $(CYAN)OpenSearch:$(NC) http://localhost:$${OPENSEARCH_PORT:-9200}"
 	@echo "   $(CYAN)Dashboards:$(NC) http://localhost:$${OPENSEARCH_DASHBOARDS_PORT:-5601}"
 
-dev-cpu: ensure-langflow-data ensure-backend-volumes ## Start full stack with CPU only
+dev-cpu: ensure-langflow-data ensure-backend-volumes check-env ## Start full stack with CPU only
 	@echo "$(YELLOW)Starting OpenRAG with CPU only...$(NC)"
 	$(COMPOSE_CMD) up -d $(SERVICES)
 	@echo "$(PURPLE)Services started!$(NC)"
@@ -435,7 +526,7 @@ dev-cpu: ensure-langflow-data ensure-backend-volumes ## Start full stack with CP
 	@echo "   $(CYAN)OpenSearch:$(NC) http://localhost:$${OPENSEARCH_PORT:-9200}"
 	@echo "   $(CYAN)Dashboards:$(NC) http://localhost:$${OPENSEARCH_DASHBOARDS_PORT:-5601}"
 
-dev-build: ensure-langflow-data ensure-backend-volumes ## Start full stack with GPU support, building all images first
+dev-build: ensure-langflow-data ensure-backend-volumes check-env ## Start full stack with GPU support, building all images first
 	@echo "$(YELLOW)Building all OpenRAG images...$(NC)"
 	$(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.gpu.yml build
 	@echo "$(YELLOW)Starting OpenRAG with GPU support...$(NC)"
@@ -447,7 +538,7 @@ dev-build: ensure-langflow-data ensure-backend-volumes ## Start full stack with 
 	@echo "   $(CYAN)OpenSearch:$(NC) http://localhost:$${OPENSEARCH_PORT:-9200}"
 	@echo "   $(CYAN)Dashboards:$(NC) http://localhost:$${OPENSEARCH_DASHBOARDS_PORT:-5601}"
 
-dev-build-cpu: ensure-langflow-data ensure-backend-volumes ## Start full stack with CPU only, building all images first
+dev-build-cpu: ensure-langflow-data ensure-backend-volumes check-env ## Start full stack with CPU only, building all images first
 	@echo "$(YELLOW)Building all OpenRAG images (CPU)...$(NC)"
 	$(COMPOSE_CMD) build
 	@echo "$(YELLOW)Starting OpenRAG with CPU only...$(NC)"
@@ -459,7 +550,7 @@ dev-build-cpu: ensure-langflow-data ensure-backend-volumes ## Start full stack w
 	@echo "   $(CYAN)OpenSearch:$(NC) http://localhost:$${OPENSEARCH_PORT:-9200}"
 	@echo "   $(CYAN)Dashboards:$(NC) http://localhost:$${OPENSEARCH_DASHBOARDS_PORT:-5601}"
 
-dev-local: ensure-langflow-data ensure-backend-volumes ## Start infrastructure for local development
+dev-local: ensure-langflow-data ensure-backend-volumes check-env ## Start infrastructure for local development
 	@echo "$(YELLOW)Building Langflow and OpenSearch images...$(NC)"
 	$(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.gpu.yml build langflow opensearch
 	@echo "$(YELLOW)Starting infrastructure only (for local development)...$(NC)"
@@ -471,7 +562,7 @@ dev-local: ensure-langflow-data ensure-backend-volumes ## Start infrastructure f
 	@echo ""
 	@echo "$(YELLOW)Now run 'make backend' and 'make frontend' in separate terminals$(NC)"
 
-dev-local-cpu: ensure-langflow-data ensure-backend-volumes ## Start infrastructure for local development, with CPU only
+dev-local-cpu: ensure-langflow-data ensure-backend-volumes check-env ## Start infrastructure for local development, with CPU only
 	@echo "$(YELLOW)Building Langflow and OpenSearch images (CPU)...$(NC)"
 	$(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.host-backend.yml build langflow opensearch
 	@echo "$(YELLOW)Starting infrastructure only (for local development)...$(NC)"
@@ -489,7 +580,7 @@ dev-local-cpu: ensure-langflow-data ensure-backend-volumes ## Start infrastructu
 # Usage: make dev-branch BRANCH=test-openai-responses
 #        make dev-branch BRANCH=feature-x REPO=https://github.com/myorg/langflow.git
 
-dev-branch: ensure-langflow-data ensure-backend-volumes ## Build & run full stack with custom Langflow branch
+dev-branch: ensure-langflow-data ensure-backend-volumes check-env ## Build & run full stack with custom Langflow branch
 	@echo "$(YELLOW)Building Langflow from branch: $(BRANCH)$(NC)"
 	@echo "   $(CYAN)Repository:$(NC) $(REPO)"
 	@echo ""
@@ -505,7 +596,7 @@ dev-branch: ensure-langflow-data ensure-backend-volumes ## Build & run full stac
 	@echo "   $(CYAN)OpenSearch:$(NC)            http://localhost:$${OPENSEARCH_PORT:-9200}"
 	@echo "   $(CYAN)Dashboards:$(NC)            http://localhost:$${OPENSEARCH_DASHBOARDS_PORT:-5601}"
 
-dev-branch-cpu: ensure-langflow-data ensure-backend-volumes ## Build & run full stack with custom Langflow branch and CPU only mode
+dev-branch-cpu: ensure-langflow-data ensure-backend-volumes check-env ## Build & run full stack with custom Langflow branch and CPU only mode
 	@echo "$(YELLOW)Building Langflow from branch: $(BRANCH)$(NC)"
 	@echo "   $(CYAN)Repository:$(NC) $(REPO)"
 	@echo ""
@@ -520,6 +611,38 @@ dev-branch-cpu: ensure-langflow-data ensure-backend-volumes ## Build & run full 
 	@echo "   $(CYAN)Frontend:$(NC)              http://localhost:$${FRONTEND_PORT:-3000}"
 	@echo "   $(CYAN)OpenSearch:$(NC)            http://localhost:$${OPENSEARCH_PORT:-9200}"
 	@echo "   $(CYAN)Dashboards:$(NC)            http://localhost:$${OPENSEARCH_DASHBOARDS_PORT:-5601}"
+
+dev-branch-local: ensure-langflow-data ensure-backend-volumes check-env ## Start infrastructure for local development with custom Langflow branch
+	@echo "$(YELLOW)Building Langflow from branch: $(BRANCH)$(NC)"
+	@echo "   $(CYAN)Repository:$(NC) $(REPO)"
+	@echo ""
+	@echo "$(YELLOW)This may take several minutes for the first build...$(NC)"
+	GIT_BRANCH=$(BRANCH) GIT_REPO=$(REPO) $(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.gpu.yml -f docker-compose.dev.yml build langflow
+	$(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.gpu.yml build opensearch
+	@echo "$(YELLOW)Starting infrastructure only (for local development) with custom Langflow build...$(NC)"
+	GIT_BRANCH=$(BRANCH) GIT_REPO=$(REPO) $(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.gpu.yml -f docker-compose.dev.yml -f docker-compose.host-backend.yml up -d opensearch dashboards langflow
+	@echo "$(PURPLE)Infrastructure started!$(NC)"
+	@echo "   $(CYAN)Langflow ($(BRANCH)):$(NC) http://localhost:$${LANGFLOW_PORT:-7860}"
+	@echo "   $(CYAN)OpenSearch:$(NC)            http://localhost:$${OPENSEARCH_PORT:-9200}"
+	@echo "   $(CYAN)Dashboards:$(NC)            http://localhost:$${OPENSEARCH_DASHBOARDS_PORT:-5601}"
+	@echo ""
+	@echo "$(YELLOW)Now run 'make backend' and 'make frontend' in separate terminals$(NC)"
+
+dev-branch-local-cpu: ensure-langflow-data ensure-backend-volumes check-env ## Start infrastructure for local development, with CPU only and custom Langflow branch
+	@echo "$(YELLOW)Building Langflow from branch: $(BRANCH)$(NC)"
+	@echo "   $(CYAN)Repository:$(NC) $(REPO)"
+	@echo ""
+	@echo "$(YELLOW)This may take several minutes for the first build...$(NC)"
+	GIT_BRANCH=$(BRANCH) GIT_REPO=$(REPO) $(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.dev.yml build langflow
+	$(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.host-backend.yml build opensearch
+	@echo "$(YELLOW)Starting infrastructure only (for local development) with CPU only and custom Langflow build...$(NC)"
+	GIT_BRANCH=$(BRANCH) GIT_REPO=$(REPO) $(COMPOSE_CMD) -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.host-backend.yml up -d opensearch dashboards langflow
+	@echo "$(PURPLE)Infrastructure started!$(NC)"
+	@echo "   $(CYAN)Langflow ($(BRANCH)):$(NC) http://localhost:$${LANGFLOW_PORT:-7860}"
+	@echo "   $(CYAN)OpenSearch:$(NC)            http://localhost:$${OPENSEARCH_PORT:-9200}"
+	@echo "   $(CYAN)Dashboards:$(NC)            http://localhost:$${OPENSEARCH_DASHBOARDS_PORT:-5601}"
+	@echo ""
+	@echo "$(YELLOW)Now run 'make backend' and 'make frontend' in separate terminals$(NC)"
 
 build-langflow-dev: ## Build only the Langflow dev image (no cache)
 	@echo "$(YELLOW)Building Langflow dev image from branch: $(BRANCH)$(NC)"
@@ -763,6 +886,18 @@ azurite-down: ## Stop Azurite emulator
 	$(COMPOSE_CMD) --profile azurite stop azurite
 	@echo "$(PURPLE)Azurite stopped.$(NC)"
 
+instana-agent-up: ## Start the local Instana host agent (forwards to INSTANA_AGENT_ENDPOINT)
+	@echo "$(YELLOW)Starting Instana host agent...$(NC)"
+	@echo "$(RED)WARNING: Local development only on Linux. Runs privileged, in the host PID namespace, with Docker socket access and uses host networking. Do not run on a shared or production host.$(NC)"
+	@if [ -z "$$INSTANA_AGENT_KEY" ]; then echo "$(RED)INSTANA_AGENT_KEY not set in $(ENV_FILE)$(NC)"; exit 1; fi
+	$(COMPOSE_CMD) --profile instana up -d instana-agent
+	@echo "$(PURPLE)Instana agent started (listening on 127.0.0.1:42699).$(NC)"
+
+instana-agent-down: ## Stop the local Instana host agent
+	@echo "$(YELLOW)Stopping Instana agent...$(NC)"
+	$(COMPOSE_CMD) --profile instana stop instana-agent
+	@echo "$(PURPLE)Instana agent stopped.$(NC)"
+
 ######################
 # INSTALLATION
 ######################
@@ -872,7 +1007,9 @@ test: ## Run all backend tests
 
 test-unit: ## Run unit tests only
 	@echo "$(YELLOW)Running unit tests...$(NC)"
-	uv run pytest tests/unit/ -v
+	@# A stale module that fails to import must not abort the whole suite;
+	@# the collection error is still reported and still fails the target.
+	uv run pytest tests/unit/ -v --continue-on-collection-errors
 	@echo "$(PURPLE)Unit tests complete.$(NC)"
 
 test-integration: ## Run integration tests (requires infrastructure)
@@ -1208,9 +1345,9 @@ health: ## Check health of all services
 	@printf "$(CYAN)Backend:$(NC)     "
 	@if curl -s -k --fail http://127.0.0.1:$${OPENRAG_BACKEND_PORT:-8000}/health >/dev/null 2>&1; then \
 		printf "$(GREEN)Healthy$(NC)\n"; \
-	elif command -v podman >/dev/null 2>&1 && podman ps --format "{{.Names}}" | grep -q "^openrag-backend$$" && podman exec -T openrag-backend curl -s -k --fail http://127.0.0.1:8000/health >/dev/null 2>&1; then \
+	elif command -v podman >/dev/null 2>&1 && podman ps --format "{{.Names}}" | grep -q "^openrag-backend$$" && podman exec openrag-backend curl -s -k --fail http://127.0.0.1:8000/health >/dev/null 2>&1; then \
 		printf "$(GREEN)Healthy$(NC)\n"; \
-	elif command -v docker >/dev/null 2>&1 && docker ps --format "{{.Names}}" | grep -q "^openrag-backend$$" && docker exec -T openrag-backend curl -s -k --fail http://127.0.0.1:8000/health >/dev/null 2>&1; then \
+	elif command -v docker >/dev/null 2>&1 && docker ps --format "{{.Names}}" | grep -q "^openrag-backend$$" && docker exec openrag-backend curl -s -k --fail http://127.0.0.1:8000/health >/dev/null 2>&1; then \
 		printf "$(GREEN)Healthy$(NC)\n"; \
 	else \
 		printf "$(RED)Not responding$(NC)\n"; \

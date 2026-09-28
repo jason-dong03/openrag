@@ -13,6 +13,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { useBulkDeleteSessionsMutation } from "@/app/api/mutations/useBulkDeleteSessionsMutation";
 import { useDeleteSessionMutation } from "@/app/api/queries/useDeleteSessionMutation";
 import {
   DropdownMenu,
@@ -24,10 +25,29 @@ import { useIsCloudBrand } from "@/contexts/brand-context";
 import { type EndpointType, useChat } from "@/contexts/chat-context";
 import { useKnowledgeFilter } from "@/contexts/knowledge-filter-context";
 import { usePermissions } from "@/hooks/use-permissions";
+import { useTypewriter } from "@/hooks/use-typewriter";
+import { useChatSelection } from "@/hooks/useChatSelection";
 import { FILES_REGEX } from "@/lib/constants";
 import { cn } from "@/lib/utils";
+import { BulkDeleteButton } from "./bulk-delete-button";
 import { DeleteSessionModal } from "./delete-session-modal";
 import { KnowledgeFilterList } from "./knowledge-filter-list";
+
+/** Renders a conversation title, typewriting it in when isFresh=true.
+ * Calls onDone once the animation completes so the parent can clear
+ * the fresh flag and prevent re-animation on revisit. */
+function ConversationTitle({
+  title,
+  isFresh,
+  onDone,
+}: {
+  title: string;
+  isFresh: boolean;
+  onDone?: () => void;
+}) {
+  const displayed = useTypewriter(title, isFresh, onDone);
+  return <>{displayed}</>;
+}
 
 // Re-export the types for backward compatibility
 export interface RawConversation {
@@ -68,12 +88,16 @@ interface NavigationProps {
   conversations?: ChatConversation[];
   isConversationsLoading?: boolean;
   onNewConversation?: () => void;
+  onSelectionChange?: (isSelecting: boolean) => void;
+  onNavigate?: () => void;
 }
 
 export function Navigation({
   conversations = [],
   isConversationsLoading = false,
   onNewConversation,
+  onSelectionChange,
+  onNavigate,
 }: NavigationProps = {}) {
   const isCloudBrand = useIsCloudBrand();
   const pathname = usePathname();
@@ -91,13 +115,26 @@ export function Navigation({
     conversationLoaded,
     loading,
   } = useChat();
+  const selection = useChatSelection({ onChange: onSelectionChange });
+
+  useEffect(() => {
+    onSelectionChange?.(selection.isSelecting);
+  }, [selection.isSelecting, onSelectionChange]);
+
+  const allIds = conversations.map((c) => c.response_id);
 
   const previousConversationCountRef = useRef(0);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [conversationToDelete, setConversationToDelete] =
     useState<ChatConversation | null>(null);
   const hasCompletedInitialLoad = useRef(false);
-  const mountTimeRef = useRef<number | null>(null);
+  const loadingPlaceholderKey = useRef(`loading-placeholder-${Date.now()}`);
+  const [freshConversationId, setFreshConversationId] = useState<string | null>(
+    null,
+  );
+  const [prevPlaceholder, setPrevPlaceholder] = useState(
+    placeholderConversation,
+  );
 
   const { selectedFilter, setSelectedFilter } = useKnowledgeFilter();
 
@@ -136,6 +173,39 @@ export function Navigation({
     },
     onError: (error) => {
       toast.error(`Failed to delete conversation: ${error.message}`);
+    },
+  });
+
+  const bulkDeleteMutation = useBulkDeleteSessionsMutation({
+    onSuccess: (res) => {
+      const deletedSet = new Set(res.deleted);
+
+      if (res.failed.length == 0) {
+        toast.success(`${res.deleted.length} conversations deleted`);
+      } else {
+        toast.success(
+          `${res.deleted.length} deleted, ${res.failed.length} couldn't be removed`,
+        );
+      }
+
+      // if we delete a conversation the user is currently on
+      if (currentConversationId && deletedSet.has(currentConversationId)) {
+        const remaining = conversations.filter(
+          (c) => !deletedSet.has(c.response_id),
+        );
+
+        if (remaining.length > 0) {
+          loadConversation(remaining[0]);
+        } else {
+          setCurrentConversationId(null);
+          startNewConversation();
+        }
+      }
+
+      selection.exit();
+    },
+    onError: (error) => {
+      toast.error(`Failed to delete conversations: ${error.message}`);
     },
   });
 
@@ -221,13 +291,6 @@ export function Navigation({
   const isOnChatPage = pathname === "/" || pathname === "/chat";
   const isOnKnowledgePage = pathname.startsWith("/knowledge");
 
-  // Track mount time to prevent auto-selection right after component mounts (e.g., after onboarding)
-  useEffect(() => {
-    if (mountTimeRef.current === null) {
-      mountTimeRef.current = Date.now();
-    }
-  }, []);
-
   // Track when initial load completes
   useEffect(() => {
     if (!isConversationsLoading && !hasCompletedInitialLoad.current) {
@@ -236,21 +299,22 @@ export function Navigation({
     }
   }, [isConversationsLoading, conversations.length]);
 
+  if (prevPlaceholder !== placeholderConversation) {
+    setPrevPlaceholder(placeholderConversation);
+    if (prevPlaceholder && !placeholderConversation && currentConversationId) {
+      setFreshConversationId(currentConversationId);
+    }
+  }
+
   // Clear placeholder when conversation count increases (new conversation was created)
   useEffect(() => {
     const currentCount = conversations.length;
-    const timeSinceMount = mountTimeRef.current
-      ? Date.now() - mountTimeRef.current
-      : Infinity;
-    const MIN_TIME_AFTER_MOUNT = 2000; // 2 seconds - prevents selection right after onboarding
-
     if (
       placeholderConversation &&
       hasCompletedInitialLoad.current &&
       currentCount > previousConversationCountRef.current &&
       conversations.length > 0 &&
-      !isConversationsLoading &&
-      timeSinceMount >= MIN_TIME_AFTER_MOUNT
+      !isConversationsLoading
     ) {
       setPlaceholderConversation(null);
       const newestConversation = conversations[0];
@@ -282,7 +346,8 @@ export function Navigation({
 
     if (isOnChatPage && !isConversationsLoading) {
       if (conversations.length === 0 && !placeholderConversation) {
-        handleNewConversation();
+        // Auto-load: no conversations — reset state without showing a placeholder
+        startNewConversation({ showPlaceholder: false });
       } else if (activeConvo) {
         loadConversation(activeConvo);
         // Don't call refreshConversations here - it causes unnecessary refetches
@@ -291,9 +356,13 @@ export function Navigation({
         currentConversationId === null &&
         !placeholderConversation
       ) {
-        handleNewConversation();
+        // Auto-load: has conversations but none selected — reset without placeholder
+        startNewConversation({ showPlaceholder: false });
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- startNewConversation and loadConversation
+    // are stable useCallback refs; placeholderConversation and currentConversationId are read inside
+    // the effect but intentionally omitted to avoid re-running on every state change.
   }, [isOnChatPage, conversations, conversationLoaded]);
 
   const newConversationFiles = conversationData?.messages
@@ -351,7 +420,11 @@ export function Navigation({
                 {isDisabled ? (
                   <div className={tabClassName}>{tabContent}</div>
                 ) : (
-                  <Link href={route.href} className={tabClassName}>
+                  <Link
+                    href={route.href}
+                    className={tabClassName}
+                    onClick={onNavigate}
+                  >
                     {tabContent}
                   </Link>
                 )}
@@ -380,21 +453,37 @@ export function Navigation({
               <h3 className="text-xs font-medium text-muted-foreground">
                 Conversations
               </h3>
-              <button
-                type="button"
-                className="p-1 hover:bg-accent rounded"
-                data-testid="new-conversation-button"
-                onClick={handleNewConversation}
-                title="Start new conversation"
-                disabled={loading}
-              >
-                <Plus
-                  className={cn(
-                    "h-4 w-4",
-                    isCloudBrand ? "text-foreground" : "text-muted-foreground",
-                  )}
-                />
-              </button>
+              <div className="flex items-center gap-1">
+                {!selection.isSelecting && (
+                  <button
+                    type="button"
+                    className="p-1 hover:bg-accent rounded"
+                    data-testid="new-conversation-button"
+                    onClick={handleNewConversation}
+                    title="Start new conversation"
+                    disabled={loading}
+                  >
+                    <Plus
+                      className={cn(
+                        "h-4 w-4",
+                        isCloudBrand
+                          ? "text-foreground"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  data-testid="chat-select-toggle"
+                  className="text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded hover:bg-accent bg-accent/50"
+                  onClick={() =>
+                    selection.isSelecting ? selection.exit() : selection.enter()
+                  }
+                >
+                  {selection.isSelecting ? "Cancel" : "Select"}
+                </button>
+              </div>
             </div>
           </div>
 
@@ -416,7 +505,9 @@ export function Navigation({
               ) : (
                 <>
                   {/* Show regular conversations */}
-                  {conversations.length === 0 && !isConversationsLoading ? (
+                  {conversations.length === 0 &&
+                  !isConversationsLoading &&
+                  !placeholderConversation ? (
                     <div className="text-[13px] text-muted-foreground py-2 pl-3">
                       No conversations yet
                     </div>
@@ -425,8 +516,9 @@ export function Navigation({
                       {/* Optimistic rendering: Show placeholder conversation button while loading */}
                       {(() => {
                         // Show placeholder when:
-                        // 1. Loading is true AND conversation doesn't exist yet (creating new conversation), OR
-                        // 2. currentConversationId exists but isn't in conversations yet (gap between response and list update)
+                        // 1. placeholderConversation is set (e.g. immediately after clicking +), OR
+                        // 2. Loading is true AND conversation doesn't exist yet (mid-stream), OR
+                        // 3. currentConversationId exists but isn't in conversations yet
                         const conversationExists = currentConversationId
                           ? conversations.some(
                               (conv) =>
@@ -435,10 +527,11 @@ export function Navigation({
                           : false;
 
                         const shouldShowPlaceholder =
-                          !conversationExists &&
-                          (loading ||
-                            (currentConversationId !== null &&
-                              currentConversationId !== undefined));
+                          placeholderConversation !== null ||
+                          (!conversationExists &&
+                            (loading ||
+                              (currentConversationId !== null &&
+                                currentConversationId !== undefined)));
 
                         // Use placeholderConversation if available
                         // Otherwise create a placeholder with currentConversationId if it exists
@@ -455,7 +548,7 @@ export function Navigation({
                               }
                             : loading
                               ? {
-                                  response_id: `loading-${Date.now()}`,
+                                  response_id: loadingPlaceholderKey.current,
                                   title: "",
                                   endpoint: endpoint,
                                   messages: [],
@@ -474,8 +567,8 @@ export function Navigation({
                             >
                               <div className="flex items-center justify-between">
                                 <div className="flex-1 min-w-0">
-                                  <div className="text-sm font-medium text-muted-foreground truncate">
-                                    <span className="thinking-dots"></span>
+                                  <div className="text-sm font-medium text-foreground truncate">
+                                    New chat...
                                   </div>
                                 </div>
                               </div>
@@ -483,12 +576,31 @@ export function Navigation({
                           )
                         );
                       })()}
+                      {selection.isSelecting && (
+                        <div className="flex items-center justify-between p-2 text-sm">
+                          <label className="flex items-center gap-2 cursor-pointer font-bold">
+                            <input
+                              type="checkbox"
+                              aria-label="Select all conversations"
+                              data-testid="chat-select-all"
+                              checked={selection.isAllSelected(allIds)}
+                              onChange={() => selection.toggleAll(allIds)}
+                            />
+                            Select all
+                          </label>
+                          <span className="text-muted-foreground/50 text-xs">
+                            {conversations.length} chats
+                          </span>
+                        </div>
+                      )}
                       {conversations.map((conversation) => (
                         <button
                           key={conversation.response_id}
                           data-testid={`conversation-button-${conversation.title}`}
                           type="button"
-                          className={`w-full px-3 h-11 rounded-lg group relative text-left ${
+                          className={`w-full h-11 rounded-lg group relative text-left ${
+                            selection.isSelecting ? "px-2" : "px-3"
+                          } ${
                             loading || isConversationsLoading
                               ? "opacity-50 cursor-not-allowed"
                               : "hover:bg-accent cursor-pointer"
@@ -498,58 +610,92 @@ export function Navigation({
                               : ""
                           }`}
                           onClick={() => {
+                            if (selection.isSelecting) {
+                              selection.toggle(conversation.response_id);
+                              return;
+                            }
                             if (loading || isConversationsLoading) return;
                             loadConversation(conversation);
+                            onNavigate?.();
                             // Don't refresh - just loading an existing conversation
                           }}
                           disabled={loading || isConversationsLoading}
                         >
                           <div className="flex items-center justify-between">
-                            <div className="flex-1 min-w-0">
+                            <div className="flex min-w-0">
+                              {selection.isSelecting && (
+                                <input
+                                  type="checkbox"
+                                  aria-label={`Select ${conversation.title}`}
+                                  data-testid={`chat-select-${conversation.response_id}`}
+                                  checked={selection.selectedIds.has(
+                                    conversation.response_id,
+                                  )}
+                                  onChange={() =>
+                                    selection.toggle(conversation.response_id)
+                                  }
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="mr-2 flex-shrink-0"
+                                />
+                              )}
                               <div className="text-sm font-medium text-foreground truncate">
-                                {conversation.title}
+                                <ConversationTitle
+                                  title={conversation.title}
+                                  isFresh={
+                                    freshConversationId ===
+                                    conversation.response_id
+                                  }
+                                  onDone={
+                                    freshConversationId ===
+                                    conversation.response_id
+                                      ? () => setFreshConversationId(null)
+                                      : undefined
+                                  }
+                                />
                               </div>
                             </div>
-                            <DropdownMenu>
-                              <DropdownMenuTrigger
-                                disabled={
-                                  loading ||
-                                  isConversationsLoading ||
-                                  deleteSessionMutation.isPending
-                                }
-                                asChild
-                              >
-                                <div
-                                  className="opacity-0 group-hover:opacity-100 data-[state=open]:opacity-100 data-[state=open]:text-foreground transition-opacity p-1 hover:bg-accent rounded text-muted-foreground hover:text-foreground ml-2 flex-shrink-0 cursor-pointer"
-                                  title="More options"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                  }}
+                            {!selection.isSelecting && (
+                              <DropdownMenu>
+                                <DropdownMenuTrigger
+                                  disabled={
+                                    loading ||
+                                    isConversationsLoading ||
+                                    deleteSessionMutation.isPending
+                                  }
+                                  asChild
                                 >
-                                  <EllipsisVertical className="h-4 w-4" />
-                                </div>
-                              </DropdownMenuTrigger>
-                              <DropdownMenuContent
-                                side="bottom"
-                                align="end"
-                                className="w-48"
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                <DropdownMenuItem
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleContextMenuAction(
-                                      "delete",
-                                      conversation,
-                                    );
-                                  }}
-                                  className="cursor-pointer text-destructive focus:text-destructive"
+                                  <div
+                                    className="opacity-0 group-hover:opacity-100 data-[state=open]:opacity-100 data-[state=open]:text-foreground transition-opacity p-1 hover:bg-accent rounded text-muted-foreground hover:text-foreground ml-2 flex-shrink-0 cursor-pointer"
+                                    title="More options"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                    }}
+                                  >
+                                    <EllipsisVertical className="h-4 w-4" />
+                                  </div>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
+                                  side="bottom"
+                                  align="end"
+                                  className="w-48"
+                                  onClick={(e) => e.stopPropagation()}
                                 >
-                                  <Trash2 className="mr-2 h-4 w-4" />
-                                  Delete conversation
-                                </DropdownMenuItem>
-                              </DropdownMenuContent>
-                            </DropdownMenu>
+                                  <DropdownMenuItem
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleContextMenuAction(
+                                        "delete",
+                                        conversation,
+                                      );
+                                    }}
+                                    className="cursor-pointer text-destructive focus:text-destructive"
+                                  >
+                                    <Trash2 className="mr-2 h-4 w-4" />
+                                    Delete conversation
+                                  </DropdownMenuItem>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            )}
                           </div>
                         </button>
                       ))}
@@ -580,6 +726,26 @@ export function Navigation({
               </div>
             )}
           </div>
+          {selection.isSelecting && (
+            <div className="flex-shrink-0 py-3 border-t mx-3">
+              <div className="flex items-center justify-between pb-1 text-xs text-muted-foreground">
+                <span>{selection.count} selected</span>
+                <span>of {conversations.length}</span>
+              </div>
+              <div className="pt-1 pb-3 w-full">
+                <BulkDeleteButton
+                  count={selection.count}
+                  isDeleting={bulkDeleteMutation.isPending}
+                  onDelete={() =>
+                    bulkDeleteMutation.mutate({
+                      session_ids: [...selection.selectedIds],
+                      endpoint,
+                    })
+                  }
+                />
+              </div>
+            </div>
+          )}
         </div>
       )}
 

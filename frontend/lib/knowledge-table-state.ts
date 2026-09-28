@@ -4,7 +4,7 @@ import type { TaskFile } from "@/contexts/task-context";
 export interface KnowledgeSourceOption {
   value: string;
   label: string;
-  count: number;
+  count?: number;
 }
 
 export function getKnowledgeFileIdentity(file?: {
@@ -142,6 +142,10 @@ function taskOverlayPriority(status?: string): number {
       return 3;
     case "failed":
       return 2;
+    case "cancelled":
+      return 2;
+    case "skipped":
+      return 2;
     case "active":
       return 1;
     default:
@@ -199,6 +203,8 @@ export function buildKnowledgeTableRows(
       connector_type: taskFile.connector_type,
       status: taskFile.status,
       error: taskFile.error,
+      skip_reason: taskFile.skip_reason,
+      warning: taskFile.warning,
       embedding_model: taskFile.embedding_model,
       embedding_dimensions: taskFile.embedding_dimensions,
     };
@@ -214,7 +220,10 @@ export function buildKnowledgeTableRows(
     if (taskFile) {
       const backendStatus = file.status ?? "active";
       const status =
-        taskFile.status === "processing" || taskFile.status === "failed"
+        taskFile.status === "processing" ||
+        taskFile.status === "failed" ||
+        taskFile.status === "cancelled" ||
+        taskFile.status === "skipped"
           ? taskFile.status
           : backendStatus;
       return {
@@ -231,9 +240,13 @@ export function buildKnowledgeTableRows(
             ),
         status,
         error: taskFile.error,
+        skip_reason: taskFile.skip_reason,
+        warning: taskFile.warning,
         embedding_model: taskFile.embedding_model ?? file.embedding_model,
         embedding_dimensions:
           taskFile.embedding_dimensions ?? file.embedding_dimensions,
+        // Preserve task_id so getTaskIdForRow can match correctly for cancellation
+        task_id: taskFile.task_id,
       };
     }
     return file;
@@ -277,22 +290,16 @@ export function buildKnowledgeTableRows(
 export function buildActiveSourceOptions(
   rows: SearchFile[],
 ): KnowledgeSourceOption[] {
-  const sourceCounts = rows
-    .filter((file) => (file.status || "active") === "active")
-    .reduce((acc, file) => {
-      const source = file.filename?.trim() || file.source_url?.trim();
-      if (!source) {
-        return acc;
-      }
-      acc.set(source, (acc.get(source) || 0) + 1);
-      return acc;
-    }, new Map<string, number>());
+  const seen = new Set<string>();
+  const options: KnowledgeSourceOption[] = [];
 
-  return Array.from(sourceCounts.entries())
-    .map(([source, count]) => ({
-      value: source,
-      label: source,
-      count,
-    }))
-    .sort((a, b) => a.label.localeCompare(b.label));
+  for (const file of rows) {
+    if ((file.status || "active") !== "active") continue;
+    const source = file.filename?.trim() || file.source_url?.trim();
+    if (!source || seen.has(source)) continue;
+    seen.add(source);
+    options.push({ value: source, label: source });
+  }
+
+  return options.sort((a, b) => a.label.localeCompare(b.label));
 }

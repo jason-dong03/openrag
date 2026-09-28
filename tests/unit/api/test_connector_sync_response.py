@@ -13,6 +13,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+
+def _permissive_rbac():
+    """RBAC stub that grants everything.
+
+    Unit tests pin OPENRAG_RBAC_ENFORCE=true (tests/unit/conftest.py), and every
+    sync now resolves knowledge:delete:anonymous up front to decide whether
+    orphan cleanup may touch ownerless chunks (see delete_orphan_documents).
+    """
+    rbac = MagicMock()
+    rbac.has_permission = AsyncMock(return_value=True)
+    return rbac
+
+
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -79,8 +92,9 @@ async def test_connector_sync_reports_one_connection_with_multiple_active(monkey
         request=MagicMock(),
         connector_service=service,
         session_manager=MagicMock(),
-        user=SimpleNamespace(user_id="alice", jwt_token="token"),
+        user=SimpleNamespace(user_id="alice", jwt_token="token", db_user_id="alice"),
         session=MagicMock(),
+        rbac=_permissive_rbac(),
     )
 
     assert response.status_code == 201
@@ -122,7 +136,7 @@ def _preview_service_with_working_connection():
 
 @pytest.mark.asyncio
 async def test_connector_sync_passes_preview_mode_to_sync_specific_files(monkeypatch):
-    """body.preview=True threads preview_mode=True into sync_specific_files (OSS/SaaS)."""
+    """body.preview=True threads preview_mode=True into sync_specific_files."""
     from api import connectors as connectors_api
     from api import documents as documents_api
 
@@ -138,8 +152,9 @@ async def test_connector_sync_passes_preview_mode_to_sync_specific_files(monkeyp
         request=MagicMock(),
         connector_service=service,
         session_manager=MagicMock(),
-        user=SimpleNamespace(user_id="alice", jwt_token="token"),
+        user=SimpleNamespace(user_id="alice", jwt_token="token", db_user_id="alice"),
         session=MagicMock(),
+        rbac=_permissive_rbac(),
     )
 
     assert response.status_code == 201
@@ -165,8 +180,9 @@ async def test_connector_sync_ignores_preview_when_disabled(monkeypatch):
         request=MagicMock(),
         connector_service=service,
         session_manager=MagicMock(),
-        user=SimpleNamespace(user_id="alice", jwt_token="token"),
+        user=SimpleNamespace(user_id="alice", jwt_token="token", db_user_id="alice"),
         session=MagicMock(),
+        rbac=_permissive_rbac(),
     )
 
     assert response.status_code == 201

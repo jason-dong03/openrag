@@ -3,9 +3,10 @@
 import { AlertTriangle } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useProviderHealthQuery } from "@/app/api/queries/useProviderHealthQuery";
-import type { ModelProvider } from "@/app/settings/_helpers/model-helpers";
+import { getProviderChrome } from "@/components/models/model-helpers";
 import { Banner, BannerIcon, BannerTitle } from "@/components/ui/banner";
 import { useChat } from "@/contexts/chat-context";
+import { useNarrowLayout } from "@/hooks/use-narrow-layout";
 import { cn } from "@/lib/utils";
 import { Button } from "./ui/button";
 
@@ -23,7 +24,9 @@ export function useProviderHealth() {
     error,
     isError,
   } = useProviderHealthQuery({
-    test_completion: hasChatError, // Use test_completion=true when chat errors occur
+    // After a chat/ingest failure, probe completion so the banner shows the
+    // real error (disabled key, missing model, etc.) — not only IAM auth.
+    test_completion: hasChatError,
   });
 
   const isHealthy = health?.status === "healthy" && !isError;
@@ -46,17 +49,10 @@ export function useProviderHealth() {
   };
 }
 
-const providerTitleMap: Record<ModelProvider, string> = {
-  openai: "OpenAI",
-  anthropic: "Anthropic",
-  ollama: "Ollama",
-  watsonx: "IBM watsonx.ai",
-  local: "Local",
-};
-
 export function ProviderHealthBanner({ className }: ProviderHealthBannerProps) {
   const { isLoading, isHealthy, isUnhealthy, health } = useProviderHealth();
   const router = useRouter();
+  const isNarrow = useNarrowLayout();
 
   // Only show banner when provider is unhealthy (not when backend is unavailable)
   if (isLoading || isHealthy) {
@@ -73,59 +69,70 @@ export function ProviderHealthBanner({ className }: ProviderHealthBannerProps) {
     let errorProvider: string | undefined;
     let errorMessage: string;
 
+    // Prefer a single shared provider when LLM and embedding fail the same way
+    // (e.g. both watsonx auth failures), so the banner stays readable.
+    let showMultipleErrors = false;
+
     if (llmError && embeddingError) {
-      // Both have errors - check if they're the same
       if (llmError === embeddingError) {
-        // Same error for both - show once
         errorMessage = llmError;
+        errorProvider =
+          llmProvider === embeddingProvider ? llmProvider : undefined;
       } else {
-        // Different errors - show both
         errorMessage = `${llmError}; ${embeddingError}`;
+        errorProvider = undefined;
+        showMultipleErrors = true;
       }
-      errorProvider = undefined; // Don't link to a specific provider
     } else if (llmError) {
-      // Only LLM has error
       errorProvider = llmProvider;
       errorMessage = llmError;
     } else if (embeddingError) {
-      // Only embedding has error
       errorProvider = embeddingProvider;
       errorMessage = embeddingError;
     } else {
-      // Fallback to original message
       errorMessage = health?.message || "Provider validation failed";
       errorProvider = llmProvider;
     }
 
+    // One label source for every provider, including ones added through
+    // config/model_providers.yaml that have no built-in chrome.
     const providerTitle = errorProvider
-      ? providerTitleMap[errorProvider as ModelProvider] || errorProvider
+      ? getProviderChrome(errorProvider).name
       : "Provider";
 
     const settingsUrl = errorProvider
       ? `/settings?setup=${errorProvider}`
       : "/settings";
 
+    const bannerLabel = showMultipleErrors
+      ? `Provider errors - ${errorMessage}`
+      : `${providerTitle} error - ${errorMessage}`;
+
     return (
       <Banner
         className={cn(
           "bg-red-50 dark:bg-red-950 text-foreground border-accent-red border-b w-full",
+          isNarrow && "flex-wrap gap-y-1 py-2",
           className,
         )}
       >
         <BannerIcon
-          className="text-accent-red-foreground"
+          className="text-accent-red-foreground shrink-0"
           icon={AlertTriangle}
         />
-        <BannerTitle className="font-medium flex items-center gap-2">
-          {llmError && embeddingError ? (
-            <>Provider errors - {errorMessage}</>
-          ) : (
-            <>
-              {providerTitle} error - {errorMessage}
-            </>
+        <BannerTitle
+          className={cn(
+            "font-medium flex items-center gap-2",
+            isNarrow && "text-xs",
           )}
+        >
+          {bannerLabel}
         </BannerTitle>
-        <Button size="sm" onClick={() => router.push(settingsUrl)}>
+        <Button
+          size="sm"
+          className="shrink-0"
+          onClick={() => router.push(settingsUrl)}
+        >
           Fix Setup
         </Button>
       </Banner>

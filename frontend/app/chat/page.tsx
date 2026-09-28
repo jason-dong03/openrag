@@ -1,19 +1,29 @@
 "use client";
 
-import { Loader2, Zap } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Loader2, Upload, Zap } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import { ProtectedRoute } from "@/components/protected-route";
 import { Button } from "@/components/ui/button";
+import { useAuth } from "@/contexts/auth-context";
 import { useIsCloudBrand } from "@/contexts/brand-context";
 import { type EndpointType, useChat } from "@/contexts/chat-context";
 import { useTask } from "@/contexts/task-context";
+import { useFileDrag } from "@/hooks/use-file-drag";
 import { useOnboardingState } from "@/hooks/use-onboarding-state";
+import { useSupportedFileTypes } from "@/hooks/use-supported-file-types";
 import { useChatStreaming } from "@/hooks/useChatStreaming";
 import { trackLLMCall } from "@/lib/analytics";
+import {
+  dedupeConsecutiveErrorMessages,
+  formatProviderErrorMessage,
+  looksLikeProviderErrorContent,
+} from "@/lib/chat-stream-errors";
 import { FILE_CONFIRMATION, FILES_REGEX } from "@/lib/constants";
 import { buildSearchPayloadFilters } from "@/lib/filter-normalization";
 import { uploadFileForContext } from "@/lib/upload-utils";
+import { resolveDisplayName } from "@/lib/user";
 import { cn } from "@/lib/utils";
 import { useGetConversationsQuery } from "../api/queries/useGetConversationsQuery";
 import { useGetNudgesQuery } from "../api/queries/useGetNudgesQuery";
@@ -30,7 +40,7 @@ import type {
   RequestBody,
   ToolCallResult,
 } from "./_types/types";
-import { INITIAL_ASSISTANT_MESSAGE } from "./_types/types";
+import { makeInitialMessage, PLACEHOLDER_GREETING } from "./_types/types";
 
 function ChatPage() {
   const isDebugMode = process.env.NEXT_PUBLIC_OPENRAG_DEBUG === "true";
@@ -53,12 +63,31 @@ function ChatPage() {
     setConversationFilter,
     loading,
     setLoading,
+    setChatError,
   } = useChat();
-  const [messages, setMessages] = useState<Message[]>([
-    INITIAL_ASSISTANT_MESSAGE,
-  ]);
+  const { user, isNoAuthMode, isLoading: isAuthLoading } = useAuth();
+  const displayName = isNoAuthMode ? null : resolveDisplayName(user);
+  const [messages, setMessages] = useState<Message[]>([PLACEHOLDER_GREETING]);
+
+  // PLACEHOLDER_GREETING is deterministic so SSR and hydration agree.
+  // After mount (and once auth has settled), replace it with the real
+  // time/day/name greeting. New Chat already does this via makeInitialMessage;
+  // first load after login previously never did, because displayName is
+  // already set when ChatPage mounts behind ProtectedRoute.
+  useEffect(() => {
+    if (isAuthLoading || conversationData) return;
+    setMessages((prev) => {
+      if (
+        prev.length === 1 &&
+        prev[0].isGreeting &&
+        prev[0].role === "assistant"
+      ) {
+        return [makeInitialMessage(displayName)];
+      }
+      return prev;
+    });
+  }, [displayName, isAuthLoading, conversationData]);
   const [input, setInput] = useState("");
-  const { setChatError } = useChat();
   const [asyncMode, setAsyncMode] = useState(true);
   const [expandedFunctionCalls, setExpandedFunctionCalls] = useState<
     Set<string>
@@ -73,9 +102,42 @@ function ChatPage() {
 
   const chatInputRef = useRef<ChatInputHandle>(null);
 
+  const { supportedFileTypes } = useSupportedFileTypes();
+
+  const handleFileDrop = useCallback(
+    (file: File) => {
+      const acceptedMimeTypes = Object.keys(supportedFileTypes);
+      const acceptedExtensions = Object.values(supportedFileTypes).flat();
+      const ext = `.${file.name.split(".").pop()?.toLowerCase() ?? ""}`;
+      const isAccepted =
+        acceptedMimeTypes.includes(file.type) ||
+        acceptedExtensions.includes(ext);
+
+      if (!isAccepted) {
+        const isImage = file.type.startsWith("image/");
+        const message = isImage
+          ? "Enable OCR in Settings to attach images"
+          : "Unsupported file type";
+        toast.error(message, {
+          duration: 1500,
+          className: "animate-toast-shake",
+        });
+        return;
+      }
+      setUploadedFile(file);
+    },
+    [supportedFileTypes],
+  );
+
+  // useFileDrag listens at the window level — fires on a drop anywhere on screen.
+  const isDraggingFile = useFileDrag(handleFileDrop);
+
   const { scrollToBottom } = useStickToBottomContext();
 
   const lastLoadedConversationRef = useRef<string | null>(null);
+  // Set when a live stream fails so history sync cannot replace one error card
+  // with Langflow's duplicated copies of the same failure.
+  const liveErrorConversationRef = useRef<string | null>(null);
   const { addTask } = useTask();
 
   // Check if chat history is loading
@@ -111,17 +173,62 @@ function ChatPage() {
   } = useChatStreaming({
     endpoint: apiEndpoint,
     onComplete: (message, responseId) => {
+      setLoading(false);
+      setWaitingTooLong(false);
+
+      setMessages((prev) => {
+        if (!message.error) {
+          return [...prev, message];
+        }
+        // One error card per failure — drop a trailing duplicate if present.
+        const withoutTrailingDup = [...prev];
+        while (
+          withoutTrailingDup.length > 0 &&
+          withoutTrailingDup[withoutTrailingDup.length - 1]?.role ===
+            "assistant" &&
+          withoutTrailingDup[withoutTrailingDup.length - 1]?.error &&
+          withoutTrailingDup[withoutTrailingDup.length - 1]?.content ===
+            message.content
+        ) {
+          withoutTrailingDup.pop();
+        }
+        return [...withoutTrailingDup, message];
+      });
+
+      if (message.error) {
+        // Latch banner deep-probe so it shows the same provider/model error.
+        setChatError(true);
+        // Sidebar id stays on currentConversationId; onError clears Langflow chaining.
+        if (responseId) {
+          liveErrorConversationRef.current = responseId;
+          if (!currentConversationId) {
+            setCurrentConversationId(responseId);
+            refreshConversations(true);
+            if (conversationFilter && typeof window !== "undefined") {
+              localStorage.setItem(
+                `conversation_filter_${responseId}`,
+                conversationFilter.id,
+              );
+            }
+          } else {
+            refreshConversationsSilent();
+          }
+        }
+        return;
+      }
+
+      // Successful turn — drop the banner deep-probe latch.
+      setChatError(false);
+
       trackLLMCall({
         mode: "chat",
         model: settings?.agent?.llm_model,
         inputTokens: message.usage?.input_tokens,
         outputTokens: message.usage?.output_tokens,
       });
-      setMessages((prev) => [...prev, message]);
-      setLoading(false);
-      setWaitingTooLong(false);
       if (responseId) {
         cancelNudges();
+        // Langflow session id for chaining; sidebar id stays on currentConversationId.
         setPreviousResponseIds((prev) => ({
           ...prev,
           [endpoint]: responseId,
@@ -136,7 +243,8 @@ function ChatPage() {
 
         // Save filter association for this response
         if (conversationFilter && typeof window !== "undefined") {
-          const newKey = `conversation_filter_${responseId}`;
+          const stableId = currentConversationId || responseId;
+          const newKey = `conversation_filter_${stableId}`;
           localStorage.setItem(newKey, conversationFilter.id);
         }
       }
@@ -145,15 +253,13 @@ function ChatPage() {
       console.error("Streaming error:", error);
       setLoading(false);
       setWaitingTooLong(false);
-      // Set chat error flag to trigger test_completion=true on health checks
+      // Set chat error flag to trigger test_completion=true on health checks.
       setChatError(true);
-      const errorMessage: Message = {
-        role: "assistant",
-        content:
-          "Sorry, I couldn't connect to the chat service. Please try again.",
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, errorMessage]);
+      // Clear Langflow session chaining; conversation_id keeps the sidebar thread.
+      setPreviousResponseIds((prev) => ({
+        ...prev,
+        [endpoint]: null,
+      }));
     },
   });
 
@@ -263,12 +369,13 @@ function ChatPage() {
       // Abort any in-flight streaming so it doesn't bleed into new chat
       abortStream();
       // Reset chat UI even if context state was already 'new'
-      setMessages([INITIAL_ASSISTANT_MESSAGE]);
+      setMessages([makeInitialMessage(displayName)]);
       setInput("");
       setExpandedFunctionCalls(new Set());
       setIsFilterHighlighted(false);
       setLoading(false);
       lastLoadedConversationRef.current = null;
+      liveErrorConversationRef.current = null;
 
       // Focus input after a short delay to ensure rendering is complete
       setTimeout(() => {
@@ -286,25 +393,52 @@ function ChatPage() {
       window.removeEventListener("newConversation", handleNewConversation);
       window.removeEventListener("focusInput", handleFocusInput);
     };
-  }, [abortStream, setLoading]);
+  }, [abortStream, setLoading, displayName]);
 
   // Load conversation data from context
   useEffect(() => {
     let focusTimeoutId: NodeJS.Timeout;
-    // Only load conversation data when:
-    // 1. conversationData exists AND
-    // 2. (It's a different conversation OR we're not streaming and data has changed) AND
-    // 3. User is not in the middle of an interaction
-    const isNewConversation =
-      lastLoadedConversationRef.current !== conversationData?.response_id;
-    const hasMessageCountChanged =
-      conversationData?.messages?.length !== messages.length;
-
-    if (
-      conversationData?.messages &&
-      (isNewConversation || (!isChatStreaming && hasMessageCountChanged)) &&
+    // Only load conversation data when remote history should win:
+    // - Switching to a different conversation always loads remote.
+    // - Same conversation: never clobber local turns that are still ahead
+    //   (failed sends append user+error before history refreshes; syncing
+    //   stale remote would wipe them and retries then duplicate in Langflow).
+    const conversationId = conversationData?.response_id ?? null;
+    const isSwitchingConversation =
+      conversationId != null &&
+      lastLoadedConversationRef.current != null &&
+      lastLoadedConversationRef.current !== conversationId;
+    const isFirstLoadOfConversation =
+      conversationId != null &&
+      lastLoadedConversationRef.current !== conversationId;
+    const remoteMessageCount = conversationData?.messages?.length ?? 0;
+    const hasMessageCountChanged = remoteMessageCount !== messages.length;
+    const localMessagesAhead = messages.length > remoteMessageCount;
+    // After a live failed send we already appended the error locally. History
+    // often returns the same provider failure repeated from Langflow — do not
+    // clobber the live transcript for that conversation id.
+    const skipSyncAfterLiveError =
+      conversationId != null &&
+      liveErrorConversationRef.current === conversationId &&
+      !isSwitchingConversation;
+    const shouldSyncSameConversation =
+      !isChatStreaming &&
+      hasMessageCountChanged &&
+      !localMessagesAhead &&
       !isUserInteracting &&
-      !isForkingInProgress
+      !isForkingInProgress;
+
+    if (skipSyncAfterLiveError) {
+      lastLoadedConversationRef.current = conversationId;
+      setPreviousResponseIds((prev) => ({
+        ...prev,
+        [conversationData?.endpoint ?? endpoint]: null,
+      }));
+    } else if (
+      conversationData?.messages &&
+      (isSwitchingConversation ||
+        (isFirstLoadOfConversation && !localMessagesAhead) ||
+        (!isFirstLoadOfConversation && shouldSyncSameConversation))
     ) {
       // Convert backend message format to frontend Message interface
       const convertedMessages: Message[] = conversationData.messages.map(
@@ -337,11 +471,17 @@ function ChatPage() {
           }>;
           response_data?: unknown;
         }) => {
+          const isProviderError =
+            Boolean(msg.error) ||
+            (msg.role === "assistant" &&
+              looksLikeProviderErrorContent(msg.content || ""));
           const message: Message = {
             role: msg.role as "user" | "assistant",
-            content: msg.content,
+            content: isProviderError
+              ? formatProviderErrorMessage(msg.content)
+              : msg.content,
             timestamp: new Date(msg.timestamp || new Date()),
-            error: msg.error || false,
+            error: isProviderError,
           };
 
           // Extract function calls from chunks or response_data
@@ -458,13 +598,31 @@ function ChatPage() {
         },
       );
 
-      setMessages(convertedMessages);
-      lastLoadedConversationRef.current = conversationData.response_id;
+      // Sort messages by timestamp to ensure they are in chronological order
+      const sortedMessages = [...convertedMessages].sort((a, b) => {
+        const aTime = a.timestamp.getTime();
+        const bTime = b.timestamp.getTime();
+        if (isNaN(aTime) && isNaN(bTime)) return 0;
+        if (isNaN(aTime)) return 1;
+        if (isNaN(bTime)) return -1;
+        return aTime - bTime;
+      });
 
-      // Set the previous response ID for this conversation
+      const dedupedMessages = dedupeConsecutiveErrorMessages(sortedMessages);
+      setMessages(dedupedMessages);
+      lastLoadedConversationRef.current = conversationData.response_id;
+      if (liveErrorConversationRef.current === conversationData.response_id) {
+        liveErrorConversationRef.current = null;
+      }
+
+      // Don't chain a session that ended in an error — Langflow often collapses
+      // follow-ups to "An unknown error occurred." and hides the real failure.
+      const lastConverted = dedupedMessages[dedupedMessages.length - 1];
       setPreviousResponseIds((prev) => ({
         ...prev,
-        [conversationData.endpoint]: conversationData.response_id,
+        [conversationData.endpoint]: lastConverted?.error
+          ? null
+          : conversationData.response_id,
       }));
 
       // Focus input when loading a conversation
@@ -484,13 +642,14 @@ function ChatPage() {
     setPreviousResponseIds,
     isChatStreaming,
     messages.length,
+    endpoint,
   ]);
 
   // Handle new conversation creation - only reset messages when placeholderConversation is set
   useEffect(() => {
     let focusTimeoutId: NodeJS.Timeout;
     if (placeholderConversation && currentConversationId === null) {
-      setMessages([INITIAL_ASSISTANT_MESSAGE]);
+      setMessages([makeInitialMessage(displayName)]);
       lastLoadedConversationRef.current = null;
 
       // Focus input when starting a new conversation
@@ -533,13 +692,21 @@ function ChatPage() {
         })()
       : undefined;
 
-    // Use passed previousResponseId if available, otherwise fall back to state
-    const responseIdToUse = previousResponseId || previousResponseIds[endpoint];
+    // OpenRAG sidebar thread vs Langflow session are separate:
+    // - conversationId keeps the same list entry after errors
+    // - previousResponseId is omitted after an error so Langflow starts fresh
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    const langflowSessionId = lastAssistant?.error
+      ? undefined
+      : previousResponseId || previousResponseIds[endpoint] || undefined;
 
     // Use the hook to send the message
     await sendStreamingMessage({
       prompt: userMessage.content,
-      previousResponseId: responseIdToUse || undefined,
+      previousResponseId: langflowSessionId,
+      conversationId: currentConversationId || undefined,
       filters: processedFilters,
       filter_id: conversationFilter?.id, // ✅ Add filter_id for this conversation
       limit: parsedFilterData?.limit ?? 10,
@@ -627,6 +794,7 @@ function ChatPage() {
             usage: result.usage,
           };
           setMessages((prev) => [...prev, assistantMessage]);
+          setChatError(false);
           if (result.response_id) {
             cancelNudges();
           }
@@ -795,6 +963,33 @@ function ChatPage() {
 
   return (
     <>
+      {/* Full-screen drag & drop overlay */}
+      <div
+        className={cn(
+          "fixed inset-0 z-50 pointer-events-none transition-[opacity,visibility] duration-200",
+          isDraggingFile ? "opacity-100 visible" : "opacity-0 invisible",
+        )}
+      >
+        {/* Blur + blue tint over page content */}
+        <div className="absolute inset-0 backdrop-blur-md bg-blue-500/10" />
+        {/* Blue glowing border ring */}
+        <div
+          className="absolute inset-0 border-[3px] border-blue-500 rounded-sm"
+          style={{
+            boxShadow:
+              "inset 0 0 0 1px rgb(59 130 246 / 0.4), 0 0 0 1px rgb(59 130 246 / 0.4)",
+          }}
+        />
+        {/* Drop label */}
+        <div className="absolute inset-0 flex items-center justify-center">
+          <div className="flex flex-col items-center gap-3">
+            <Upload className="h-8 w-8 text-blue-400 drop-shadow-md" />
+            <p className="text-sm text-blue-300 font-semibold tracking-widest uppercase">
+              Drop to attach file
+            </p>
+          </div>
+        </div>
+      </div>
       {/* Debug header - only show in debug mode */}
       {isDebugMode && (
         <div className="flex items-center justify-between p-6">
@@ -844,9 +1039,11 @@ function ChatPage() {
       )}
 
       <StickToBottom.Content
-        className={cn("flex flex-col min-h-full overflow-x-hidden p-6")}
+        className={cn(
+          "flex flex-col min-h-full overflow-x-hidden px-3 py-6 sm:p-6",
+        )}
       >
-        <div className="flex flex-col place-self-center space-y-6 max-w-content w-full mx-auto">
+        <div className="flex flex-col space-y-6 max-w-content w-full sm:mx-auto">
           {messages.length === 0 && !streamingMessage ? (
             <div className="flex items-center justify-center h-full text-muted-foreground">
               <div className="text-center">
@@ -923,12 +1120,7 @@ function ChatPage() {
                             onFork={(e) => handleForkConversation(index, e)}
                             animate={false}
                             isInactive={index < messages.length - 1}
-                            isInitialGreeting={
-                              index === 0 &&
-                              messages.length === 1 &&
-                              message.content ===
-                                INITIAL_ASSISTANT_MESSAGE.content
-                            }
+                            isInitialGreeting={!!message.isGreeting}
                             usage={message.usage}
                             timestamp={message.timestamp}
                           />
@@ -967,7 +1159,7 @@ function ChatPage() {
             </>
           )}
           {!streamingMessage && (
-            <div className="pl-10">
+            <div className="pl-0 sm:pl-10">
               <Nudges
                 nudges={loading ? [] : (nudges as string[])}
                 handleSuggestionClick={handleSuggestionClick}
@@ -976,7 +1168,7 @@ function ChatPage() {
           )}
         </div>
       </StickToBottom.Content>
-      <div className="p-6 pt-0 max-w-content mx-auto w-full">
+      <div className="px-3 pb-6 pt-0 max-w-content w-full sm:px-6 sm:mx-auto">
         {/* Input Area - Fixed at bottom */}
         <ChatInput
           ref={chatInputRef}

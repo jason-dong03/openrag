@@ -13,6 +13,10 @@ import { useGetOpenAIModelsQuery } from "@/app/api/queries/useGetModelsQuery";
 import { useGetSettingsQuery } from "@/app/api/queries/useGetSettingsQuery";
 import type { ProviderHealthResponse } from "@/app/api/queries/useProviderHealthQuery";
 import OpenAILogo from "@/components/icons/openai-logo";
+import {
+  canRemoveProvider,
+  isProviderConfigured,
+} from "@/components/models/model-helpers";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -48,13 +52,9 @@ const OpenAISettingsDialog = ({
     enabled: isAuthenticated || isNoAuthMode,
   });
 
-  const isOpenAIConfigured = settings.providers?.openai?.configured === true;
+  const isOpenAIConfigured = isProviderConfigured(settings.providers, "openai");
 
-  const canRemoveOpenAI =
-    isOpenAIConfigured &&
-    (settings.providers?.anthropic?.configured === true ||
-      settings.providers?.watsonx?.configured === true ||
-      settings.providers?.ollama?.configured === true);
+  const canRemoveOpenAI = canRemoveProvider(settings.providers, "openai");
 
   const methods = useForm<OpenAISettingsFormData>({
     mode: "onSubmit",
@@ -99,7 +99,7 @@ const OpenAISettingsDialog = ({
         action: {
           label: "Settings",
           onClick: () => {
-            router.push("/settings/langflow?focusLlmModel=true");
+            router.push("/settings/agent?focusLlmModel=true");
           },
         },
       });
@@ -159,9 +159,12 @@ const OpenAISettingsDialog = ({
         setOpen(o);
       }}
     >
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-2xl overflow-hidden">
         <FormProvider {...methods}>
-          <form onSubmit={handleSubmit(onSubmit)} className="grid gap-4">
+          <form
+            onSubmit={handleSubmit(onSubmit)}
+            className="grid min-w-0 gap-4"
+          >
             <DialogHeader className="mb-2">
               <DialogTitle className="flex items-center gap-3">
                 <div className="w-8 h-8 rounded flex items-center justify-center bg-white border">
@@ -184,7 +187,7 @@ const OpenAISettingsDialog = ({
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
                 >
-                  <p className="rounded-lg border border-destructive p-4">
+                  <p className="rounded-lg border border-destructive p-4 min-w-0 [overflow-wrap:anywhere]">
                     {settingsMutation.error?.message}
                   </p>
                 </motion.div>
@@ -197,7 +200,7 @@ const OpenAISettingsDialog = ({
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -10 }}
                   >
-                    <p className="rounded-lg border border-destructive p-4">
+                    <p className="rounded-lg border border-destructive p-4 min-w-0 [overflow-wrap:anywhere]">
                       {removeMutation.error?.message}
                     </p>
                   </motion.div>

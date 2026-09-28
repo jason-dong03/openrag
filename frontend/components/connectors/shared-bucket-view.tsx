@@ -48,6 +48,10 @@ export interface SharedBucketViewProps {
   showShared?: boolean;
   /** Buckets to pre-select once `buckets` has loaded, e.g. from saved connector defaults. */
   initialSelectedBuckets?: string[];
+  /** Singular label for the resource type, e.g. "bucket" or "container". Defaults to "container". */
+  resourceLabel?: string;
+  /** Plural label for the resource type, e.g. "buckets" or "containers". Defaults to "containers". */
+  resourceLabelPlural?: string;
 }
 
 export function SharedBucketView({
@@ -58,12 +62,15 @@ export function SharedBucketView({
   onRefetch,
   invalidateQueryKey,
   syncMutation,
+  resourceLabel = "container",
+  resourceLabelPlural = "containers",
   addTask,
   onBack,
   onDone,
   showShared = false,
   initialSelectedBuckets,
 }: SharedBucketViewProps) {
+  const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
   const queryClient = useQueryClient();
   const { isAuthenticated, isNoAuthMode } = useAuth();
   const { data: apiSettings } = useGetSettingsQuery({
@@ -91,7 +98,6 @@ export function SharedBucketView({
   const [pendingDuplicates, setPendingDuplicates] = useState<{
     duplicateNames: string[];
     duplicateCount: number;
-    duplicateFiles: BucketDuplicateFile[];
     nonDuplicateFiles: BucketDuplicateFile[];
   } | null>(null);
   const isOverwriteConfirmedRef = useRef(false);
@@ -170,9 +176,12 @@ export function SharedBucketView({
   };
 
   // Full bucket sync: backend classifies new/changed/unchanged itself and
-  // re-ingests both new and changed blobs (used both when there are no
-  // duplicates and when the user chooses to overwrite them).
-  const runBucketSync = () => {
+  // re-ingests both new and changed blobs. With `replaceDuplicates`, it instead
+  // re-ingests the whole selection and replaces what is already indexed — the
+  // overwrite path. Either way the bucket names travel instead of the file
+  // list, so the request stays the same size for a 10-object bucket and a
+  // 10,000-object one.
+  const runBucketSync = (replaceDuplicates = false) => {
     syncMutation.mutate(
       {
         connectorType: connector.type,
@@ -181,6 +190,7 @@ export function SharedBucketView({
           selected_files: [],
           bucket_filter: Array.from(selectedBuckets),
           settings: ingestSettings,
+          replace_duplicates: replaceDuplicates,
           shared: showSharedToggle
             ? (ingestSettings.shared ?? false)
             : undefined,
@@ -190,15 +200,11 @@ export function SharedBucketView({
     );
   };
 
-  // Sync explicit files. `replaceDuplicates` forces an unconditional
-  // re-ingest (bypassing the bucket_filter path's modified-time gate) —
-  // used when the user confirms "Overwrite duplicates" so an already
-  // up-to-date file still gets re-ingested, matching what "overwrite" means
-  // for the OAuth connectors.
-  const runSelectedFilesSync = (
-    files: BucketDuplicateFile[],
-    replaceDuplicates = false,
-  ) => {
+  // Sync an explicit subset of the listing — how "skip duplicates" ingests
+  // only the files that are not already indexed. (Overwrite goes through
+  // runBucketSync(true) instead: it needs the whole selection, and naming the
+  // buckets says that in one line.)
+  const runSelectedFilesSync = (files: BucketDuplicateFile[]) => {
     syncMutation.mutate(
       {
         connectorType: connector.type,
@@ -206,7 +212,7 @@ export function SharedBucketView({
           connection_id: connector.connectionId!,
           selected_files: files,
           settings: ingestSettings,
-          replace_duplicates: replaceDuplicates,
+          replace_duplicates: false,
           shared: showSharedToggle
             ? (ingestSettings.shared ?? false)
             : undefined,
@@ -265,7 +271,6 @@ export function SharedBucketView({
       setPendingDuplicates({
         duplicateNames,
         duplicateCount,
-        duplicateFiles: checkData.duplicate_files || [],
         nonDuplicateFiles: checkData.non_duplicate_files || [],
       });
       setDuplicateDialogOpen(true);
@@ -282,8 +287,7 @@ export function SharedBucketView({
   const handleOverwriteDuplicates = () => {
     if (!pendingDuplicates) return;
     isOverwriteConfirmedRef.current = true;
-    const { duplicateFiles, nonDuplicateFiles } = pendingDuplicates;
-    runSelectedFilesSync([...duplicateFiles, ...nonDuplicateFiles], true);
+    runBucketSync(true);
     setPendingDuplicates(null);
   };
 
@@ -323,7 +327,7 @@ export function SharedBucketView({
       <div className="max-w-3xl mx-auto space-y-4">
         <div className="flex items-center justify-between">
           <p className="text-sm text-muted-foreground">
-            Select buckets to ingest.
+            Select {resourceLabelPlural} to ingest.
           </p>
           <div className="flex items-center gap-2">
             {selectedBuckets.size > 0 && (
@@ -355,7 +359,7 @@ export function SharedBucketView({
                 size={14}
                 className={isLoading ? "animate-spin" : ""}
               />
-              Refresh Buckets
+              Refresh {capitalize(resourceLabelPlural)}
             </Button>
           </div>
         </div>
@@ -371,7 +375,7 @@ export function SharedBucketView({
           </div>
         ) : !buckets?.length ? (
           <div className="rounded-lg border p-6 text-center text-muted-foreground text-sm">
-            No buckets found. Check your credentials and endpoint.
+            No {resourceLabelPlural} found. Check your credentials and endpoint.
           </div>
         ) : (
           <div className="rounded-lg border divide-y">
@@ -484,8 +488,8 @@ export function SharedBucketView({
               : isCheckingDuplicates
                 ? "Checking…"
                 : selectedBuckets.size > 0
-                  ? `Ingest ${selectedBuckets.size} Bucket${selectedBuckets.size !== 1 ? "s" : ""}`
-                  : "Select Buckets to Ingest"}
+                  ? `Ingest ${selectedBuckets.size} ${selectedBuckets.size === 1 ? capitalize(resourceLabel) : capitalize(resourceLabelPlural)}`
+                  : `Select ${capitalize(resourceLabelPlural)} to Ingest`}
           </Button>
         </div>
       </div>

@@ -1,24 +1,33 @@
 "use client";
 
-import { ArrowUpRight, Loader2, Minus, Plus } from "lucide-react";
+import { ArrowUpRight, ChevronDown, Loader2, Minus, Plus } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
-  useGetAnthropicModelsQuery,
   useGetIBMModelsQuery,
+  useGetModelCatalogQuery,
   useGetOllamaModelsQuery,
-  useGetOpenAIModelsQuery,
 } from "@/app/api/queries/useGetModelsQuery";
 import { useGetSettingsQuery } from "@/app/api/queries/useGetSettingsQuery";
 import { ConfirmationDialog } from "@/components/confirmation-dialog";
 import { LabelWrapper } from "@/components/label-wrapper";
-import { RequirePermission } from "@/components/require-permission";
 import {
-  Accordion,
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger,
-} from "@/components/ui/accordion";
+  findGroupedSelection,
+  groupedCatalogOptions,
+  LIVE_INVENTORY_PROVIDERS,
+  liveModelOption,
+  mergeLiveCatalogOptions,
+} from "@/components/models/catalog-models";
+import { ModelFeatures } from "@/components/models/model-features";
+import {
+  getModelLogo,
+  requiresExplicitModelSelection,
+} from "@/components/models/model-helpers";
+import {
+  type GroupedModelOption,
+  ModelSelector,
+} from "@/components/models/model-selector";
+import { RequirePermission } from "@/components/require-permission";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -27,6 +36,11 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { NumberInput } from "@/components/ui/inputs/number-input";
 import { Label } from "@/components/ui/label";
@@ -41,13 +55,12 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/contexts/auth-context";
 import { useIsCloudBrand } from "@/contexts/brand-context";
+import { useRegisterDirty } from "@/contexts/unsaved-changes-context";
 import { trackButton } from "@/lib/analytics";
 import { DEFAULT_KNOWLEDGE_SETTINGS } from "@/lib/constants";
 import { resolveLangflowEditUrl } from "@/lib/url-utils";
 import { cn } from "@/lib/utils";
 import { useUpdateSettingsMutation } from "../../api/mutations/useUpdateSettingsMutation";
-import { ModelSelector } from "../../onboarding/_components/model-selector";
-import { getModelLogo } from "../_helpers/model-helpers";
 import { LangflowIcon } from "./langflow-icon";
 
 const DEFAULT_WATSONX_API_VERSION = "2023-05-29";
@@ -63,6 +76,7 @@ export function IngestSettingsSection() {
   const { isAuthenticated, isNoAuthMode, isIbmAuthMode, runMode } = useAuth();
 
   const [isRestoringFlow, setIsRestoringFlow] = useState<boolean>(false);
+  const [userEdited, setUserEdited] = useState(false);
 
   const [chunkSize, setChunkSize] = useState<number>(1024);
   const [chunkOverlap, setChunkOverlap] = useState<number>(50);
@@ -76,7 +90,7 @@ export function IngestSettingsSection() {
   const [disableIngestWithLangflow, setDisableIngestWithLangflow] =
     useState<boolean>(false);
 
-  const [vlmProvider, setVlmProvider] = useState<string>("openai");
+  const [vlmProvider, setVlmProvider] = useState<string>("");
   const [vlmModel, setVlmModel] = useState<string>("");
   const [vlmPrompt, setVlmPrompt] = useState<string>("");
   const [vlmResponseFormat, setVlmResponseFormat] =
@@ -95,176 +109,152 @@ export function IngestSettingsSection() {
 
   const showVlmSettings = settings.show_vlm_settings ?? true;
 
-  const { data: openaiModels, isLoading: openaiLoading } =
-    useGetOpenAIModelsQuery(
-      { apiKey: "" },
-      { enabled: settings?.providers?.openai?.configured === true },
-    );
-  const { data: anthropicModels, isLoading: anthropicLoading } =
-    useGetAnthropicModelsQuery(
-      { apiKey: "" },
-      { enabled: settings?.providers?.anthropic?.configured === true },
-    );
-  const { data: ollamaModels, isLoading: ollamaLoading } =
-    useGetOllamaModelsQuery(
-      { endpoint: settings?.providers?.ollama?.endpoint },
-      {
-        enabled:
-          settings?.providers?.ollama?.configured === true &&
-          !!settings?.providers?.ollama?.endpoint,
-      },
-    );
-  const { data: watsonxModels, isLoading: watsonxLoading } =
-    useGetIBMModelsQuery(
-      {
-        endpoint: settings?.providers?.watsonx?.endpoint,
-        apiKey: "",
-        projectId: settings?.providers?.watsonx?.project_id,
-      },
-      {
-        enabled:
-          settings?.providers?.watsonx?.configured === true &&
-          !!settings?.providers?.watsonx?.endpoint &&
-          !!settings?.providers?.watsonx?.project_id,
-      },
-    );
+  const {
+    data: catalog,
+    isLoading: catalogLoading,
+    // The catalogue query does not retry, so a failed fetch leaves the groups
+    // empty. Without this flag the selector would tell the user to configure a
+    // provider when the real problem is that the catalogue never loaded.
+    isError: catalogError,
+  } = useGetModelCatalogQuery({
+    enabled: isAuthenticated || isNoAuthMode,
+  });
 
-  const groupedEmbeddingModels = useMemo(
-    () =>
-      [
-        {
-          group: "OpenAI",
-          provider: "openai",
-          icon: getModelLogo("", "openai"),
-          models: openaiModels?.embedding_models || [],
-          configured: settings.providers?.openai?.configured === true,
-        },
-        {
-          group: "Ollama",
-          provider: "ollama",
-          icon: getModelLogo("", "ollama"),
-          models: ollamaModels?.embedding_models || [],
-          configured: settings.providers?.ollama?.configured === true,
-        },
-        {
-          group: "IBM watsonx.ai",
-          provider: "watsonx",
-          icon: getModelLogo("", "watsonx"),
-          models: watsonxModels?.embedding_models || [],
-          configured: settings.providers?.watsonx?.configured === true,
-        },
-      ]
-        .filter((p) => p.configured)
-        .map((p) => ({
-          group: p.group,
-          icon: p.icon,
-          options: p.models.map((m) => ({ ...m, provider: p.provider })),
-        })),
-    [
-      openaiModels?.embedding_models,
-      ollamaModels?.embedding_models,
-      watsonxModels?.embedding_models,
-      settings.providers?.openai?.configured,
-      settings.providers?.ollama?.configured,
-      settings.providers?.watsonx?.configured,
-    ],
+  const configuredProviders = useMemo(
+    () => ({
+      openai: settings.providers?.openai?.configured === true,
+      anthropic: settings.providers?.anthropic?.configured === true,
+      ollama: settings.providers?.ollama?.configured === true,
+      watsonx: settings.providers?.watsonx?.configured === true,
+      ...Object.fromEntries(
+        Object.entries(settings.providers?.custom ?? {}).map(
+          ([provider, value]) => [provider, value.configured === true],
+        ),
+      ),
+    }),
+    [settings.providers],
   );
 
+  // watsonx and Ollama publish their inventory from the running server, not
+  // from LiteLLM's bundled table, which carries *no* embedding models for
+  // either of them — so the live list is the only thing that puts their group
+  // in this picker at all.
+  //
+  // Fetched whenever the provider is configured, never gated on it already
+  // being the selected embedding provider: the whole point of the group is to
+  // be there before you pick it. Gating on selection is why watsonx stayed
+  // missing after the first attempt at this.
+  const authed = isAuthenticated || isNoAuthMode;
+  const watsonx = settings.providers?.watsonx;
+  const ollama = settings.providers?.ollama;
+
+  const ibmModels = useGetIBMModelsQuery(
+    {
+      endpoint: watsonx?.endpoint,
+      projectId: watsonx?.project_id,
+      useEnvKey: true,
+    },
+    {
+      enabled:
+        authed &&
+        configuredProviders.watsonx &&
+        !!watsonx?.endpoint &&
+        !!watsonx?.project_id,
+    },
+  );
+  const ollamaModels = useGetOllamaModelsQuery(
+    { endpoint: ollama?.endpoint },
+    { enabled: authed && configuredProviders.ollama && !!ollama?.endpoint },
+  );
+
+  const groupedEmbeddingModels = useMemo(() => {
+    const named = (key: string) =>
+      catalog?.providers?.find((provider) => provider.key === key)?.name;
+    const liveFor = (key: string, models?: { value: string }[]) =>
+      (models ?? []).map((model) => liveModelOption(model.value, key));
+
+    let groups = groupedCatalogOptions(
+      catalog,
+      configuredProviders,
+      "embedding",
+    );
+    const liveByProvider: Record<string, { value: string }[] | undefined> = {
+      watsonx: ibmModels.data?.embedding_models,
+      ollama: ollamaModels.data?.embedding_models,
+    };
+    for (const key of LIVE_INVENTORY_PROVIDERS) {
+      groups = mergeLiveCatalogOptions(
+        groups,
+        key,
+        liveFor(key, liveByProvider[key]),
+        named(key),
+      );
+    }
+    return groups.map((group) => ({
+      group: group.group,
+      provider: group.key,
+      icon: getModelLogo("", group.key),
+      options: group.options,
+    }));
+  }, [catalog, configuredProviders, ibmModels.data, ollamaModels.data]);
+
   const isLoadingAnyEmbeddingModels =
-    openaiLoading || ollamaLoading || watsonxLoading;
+    catalogLoading || ibmModels.isLoading || ollamaModels.isLoading;
 
   const groupedVlmModels = useMemo(() => {
-    const list: any[] = [];
+    const list: GroupedModelOption[] = groupedCatalogOptions(
+      catalog,
+      configuredProviders,
+      "vision",
+    ).map((group) => ({
+      group: group.group,
+      provider: group.key,
+      icon: getModelLogo("", group.key),
+      options: group.options,
+    }));
 
-    // 1. Local Models
     if (settings.local_vlm_models && settings.local_vlm_models.length > 0) {
-      list.push({
+      list.unshift({
         group: "Local Models",
+        provider: "local",
         icon: getModelLogo("", "local"),
         options: settings.local_vlm_models.map((m: string) => ({
           value: m,
-          label: m.split("/").pop(),
+          label: m.split("/").pop() ?? m,
           provider: "local",
         })),
       });
     }
 
-    // 2. OpenAI
-    if (settings.providers?.openai?.configured) {
-      const models = (openaiModels?.language_models || [])
-        .filter((m: any) => m.supports_images === true)
-        .map((m: any) => ({ ...m, provider: "openai" }));
-      if (models.length > 0) {
-        list.push({
-          group: "OpenAI",
-          icon: getModelLogo("", "openai"),
-          options: models,
-        });
-      }
-    }
-
-    // 3. Anthropic
-    if (settings.providers?.anthropic?.configured) {
-      const models = (anthropicModels?.language_models || [])
-        .filter((m: any) => m.supports_images === true)
-        .map((m: any) => ({ ...m, provider: "anthropic" }));
-      if (models.length > 0) {
-        list.push({
-          group: "Anthropic",
-          icon: getModelLogo("", "anthropic"),
-          options: models,
-        });
-      }
-    }
-
-    // 4. Ollama
-    if (settings.providers?.ollama?.configured) {
-      const models = (ollamaModels?.language_models || [])
-        .filter((m: any) => m.supports_images === true)
-        .map((m: any) => ({ ...m, provider: "ollama" }));
-      if (models.length > 0) {
-        list.push({
-          group: "Ollama",
-          icon: getModelLogo("", "ollama"),
-          options: models,
-        });
-      }
-    }
-
-    // 5. IBM watsonx.ai
-    if (settings.providers?.watsonx?.configured) {
-      const models = (watsonxModels?.language_models || [])
-        .filter((m: any) => m.supports_images === true)
-        .map((m: any) => ({ ...m, provider: "watsonx" }));
-      if (models.length > 0) {
-        list.push({
-          group: "IBM watsonx.ai",
-          icon: getModelLogo("", "watsonx"),
-          options: models,
-        });
-      }
-    }
-
     return list;
-  }, [
-    settings.local_vlm_models,
-    settings.providers?.openai?.configured,
-    settings.providers?.anthropic?.configured,
-    settings.providers?.ollama?.configured,
-    settings.providers?.watsonx?.configured,
-    openaiModels?.language_models,
-    anthropicModels?.language_models,
-    ollamaModels?.language_models,
-    watsonxModels?.language_models,
-  ]);
+  }, [catalog, configuredProviders, settings.local_vlm_models]);
 
-  const isLoadingAnyVlmModels =
-    openaiLoading || anthropicLoading || ollamaLoading || watsonxLoading;
+  const isLoadingAnyVlmModels = catalogLoading;
 
   const allVlmOptions = useMemo(
     () => groupedVlmModels.flatMap((g) => g.options),
     [groupedVlmModels],
   );
+
+  const knownProvider = vlmProvider || settings.knowledge?.vlm_provider;
+  const targetModel = vlmModel || settings.knowledge?.vlm_model;
+  const selectedVlmMatch = findGroupedSelection(
+    groupedVlmModels,
+    targetModel,
+    knownProvider,
+  );
+  const selectedVlmOption =
+    selectedVlmMatch?.option ||
+    (targetModel
+      ? allVlmOptions.find((o) => o.value === targetModel)
+      : undefined) ||
+    allVlmOptions[0];
+
+  const effectiveVlmProvider =
+    selectedVlmMatch?.group?.provider ||
+    selectedVlmOption?.provider ||
+    knownProvider ||
+    "";
 
   const updateSettingsMutation = useUpdateSettingsMutation({
     onSuccess: () => {
@@ -279,6 +269,16 @@ export function IngestSettingsSection() {
     () => groupedEmbeddingModels.flatMap((g) => g.options),
     [groupedEmbeddingModels],
   );
+  const selectedEmbeddingMatch = findGroupedSelection(
+    groupedEmbeddingModels,
+    settings.knowledge?.embedding_model,
+    settings.knowledge?.embedding_provider,
+  );
+  const selectedEmbedding = selectedEmbeddingMatch?.option;
+  const selectedEmbeddingGroup = selectedEmbeddingMatch?.group;
+  const needsExplicitEmbeddingModel =
+    requiresExplicitModelSelection(settings.knowledge?.embedding_provider) &&
+    !settings.knowledge?.embedding_model;
 
   const handleEmbeddingModelChange = useCallback(
     (newModel: string, provider?: string) => {
@@ -295,7 +295,14 @@ export function IngestSettingsSection() {
   );
 
   const autoSelectedEmbedding = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: provider changes reset the one-shot fallback guard.
   useEffect(() => {
+    autoSelectedEmbedding.current = false;
+  }, [settings.knowledge?.embedding_provider]);
+
+  useEffect(() => {
+    if (requiresExplicitModelSelection(settings.knowledge?.embedding_provider))
+      return;
     if (settings.knowledge?.embedding_model) {
       autoSelectedEmbedding.current = false;
       return;
@@ -309,6 +316,7 @@ export function IngestSettingsSection() {
     }
   }, [
     settings.knowledge?.embedding_model,
+    settings.knowledge?.embedding_provider,
     allEmbeddingOptions,
     handleEmbeddingModelChange,
   ]);
@@ -324,10 +332,13 @@ export function IngestSettingsSection() {
       setPictureDescriptions(k.picture_descriptions);
     if (k.disable_ingest_with_langflow !== undefined)
       setDisableIngestWithLangflow(k.disable_ingest_with_langflow);
-    if (k.vlm_provider !== undefined) setVlmProvider(k.vlm_provider);
-    // Backend defaults vlm_model to ""; an empty value means "not configured",
-    // so don't clobber a locally auto-selected model with it.
-    if (k.vlm_model) setVlmModel(k.vlm_model);
+    // Backend defaults vlm_model to "" and vlm_provider to "openai".
+    // Only adopt backend's vlm_provider if backend also has a configured vlm_model,
+    // so the static backend default does not clobber the locally auto-selected model's provider.
+    if (k.vlm_model) {
+      setVlmModel(k.vlm_model);
+      if (k.vlm_provider !== undefined) setVlmProvider(k.vlm_provider);
+    }
     if (k.vlm_prompt !== undefined) setVlmPrompt(k.vlm_prompt);
     if (k.vlm_response_format !== undefined)
       setVlmResponseFormat(k.vlm_response_format);
@@ -338,36 +349,59 @@ export function IngestSettingsSection() {
       setVlmWatsonxApiVersion(k.vlm_watsonx_api_version);
   }, [settings.knowledge]);
 
-  const [vlmAccordionValue, setVlmAccordionValue] = useState<string>("");
+  const [vlmOpen, setVlmOpen] = useState(false);
 
   const autoSelectedVlm = useRef(false);
   useEffect(() => {
     if (!showVlmSettings) return;
-    if (settings.knowledge?.vlm_model) {
+    // The catalogue query can resolve before the settings query. Picking a
+    // model then would lock in a choice made without knowing what the agent
+    // runs — and the ref below makes that choice permanent.
+    if (!settings.knowledge) return;
+    if (settings.knowledge.vlm_model) {
       autoSelectedVlm.current = false;
       return;
     }
     if (autoSelectedVlm.current) return;
-    if (settings.local_vlm_models && settings.local_vlm_models.length > 0) {
-      setVlmModel(settings.local_vlm_models[0]);
-      setVlmProvider("local");
-      autoSelectedVlm.current = true;
-    } else if (allVlmOptions.length > 0) {
-      const fallback = allVlmOptions.find((o) => o.default) || allVlmOptions[0];
+    if (allVlmOptions.length > 0) {
+      // Prefer the model the agent already runs on, when it can see. The
+      // catalogue is ranked by how recent an id looks, so its first vision row
+      // is whatever the provider published most recently — which for Azure is a
+      // deployment name the operator very likely does not have, since Azure
+      // serves only the deployments they created. The agent's model is one that
+      // demonstrably resolves on this account.
+      const agentModel = settings.agent?.llm_model;
+      const agentProvider = settings.agent?.llm_provider;
+      const agentVisionOption = agentModel
+        ? (allVlmOptions.find(
+            (o) => o.value === agentModel && o.provider === agentProvider,
+          ) ?? allVlmOptions.find((o) => o.value === agentModel))
+        : undefined;
+      const fallback =
+        agentVisionOption ||
+        allVlmOptions.find((o) => o.default) ||
+        allVlmOptions[0];
       setVlmModel(fallback.value);
-      setVlmProvider(fallback.provider || "openai");
+      setVlmProvider(fallback.provider || "");
       autoSelectedVlm.current = true;
     }
   }, [
     showVlmSettings,
-    settings.knowledge?.vlm_model,
-    settings.local_vlm_models,
+    settings.knowledge,
+    settings.agent?.llm_model,
+    settings.agent?.llm_provider,
     allVlmOptions,
   ]);
 
   const handleVlmModelChange = (value: string, provider?: string) => {
+    setUserEdited(true);
     setVlmModel(value);
-    if (provider) setVlmProvider(provider);
+    const resolvedProvider =
+      provider ||
+      allVlmOptions.find((o) => o.value === value)?.provider ||
+      allVlmOptions[0]?.provider ||
+      "";
+    if (resolvedProvider) setVlmProvider(resolvedProvider);
     setValidationError(null);
   };
 
@@ -378,7 +412,7 @@ export function IngestSettingsSection() {
   const vlmDirty =
     showVlmSettings &&
     (pictureDescriptions !== (k?.vlm_enabled ?? pictureDescriptions) ||
-      vlmProvider !== (k?.vlm_provider ?? vlmProvider) ||
+      effectiveVlmProvider !== (k?.vlm_provider ?? effectiveVlmProvider) ||
       vlmModel !== (k?.vlm_model ?? vlmModel) ||
       vlmPrompt !== (k?.vlm_prompt ?? vlmPrompt) ||
       vlmResponseFormat !== (k?.vlm_response_format ?? vlmResponseFormat) ||
@@ -398,35 +432,30 @@ export function IngestSettingsSection() {
       (k?.disable_ingest_with_langflow ?? disableIngestWithLangflow) ||
     vlmDirty;
 
+  useRegisterDirty("ingest-settings", userEdited && knowledgeIngestDirty);
+
+  // Resolve through the same map that builds the groups: the catalogue now
+  // contributes custom LiteLLM providers, so a hard-coded chain would report
+  // OpenAI's state for any provider outside the four legacy keys.
   const providerConfigured =
     settings.providers === undefined || settings.providers === null
       ? undefined
-      : vlmProvider === "watsonx"
-        ? settings.providers.watsonx?.configured === true
-        : vlmProvider === "anthropic"
-          ? settings.providers.anthropic?.configured === true
-          : vlmProvider === "ollama"
-            ? settings.providers.ollama?.configured === true
-            : vlmProvider === "local"
-              ? true
-              : settings.providers.openai?.configured === true;
+      : effectiveVlmProvider === "local"
+        ? true
+        : configuredProviders[
+            effectiveVlmProvider as keyof typeof configuredProviders
+          ] === true;
 
   const providerWarning = pictureDescriptions && providerConfigured === false;
-  const providerLabel =
-    vlmProvider === "watsonx"
-      ? "IBM watsonx.ai"
-      : vlmProvider === "anthropic"
-        ? "Anthropic"
-        : vlmProvider === "ollama"
-          ? "Ollama"
-          : "OpenAI";
 
   const handleChunkSizeChange = (value: string) => {
+    setUserEdited(true);
     setChunkSize(Math.max(0, Number.parseInt(value, 10) || 0));
     setChunkValidationError(null);
   };
 
   const handleChunkOverlapChange = (value: string) => {
+    setUserEdited(true);
     setChunkOverlap(Math.max(0, Number.parseInt(value, 10) || 0));
     setChunkValidationError(null);
   };
@@ -437,8 +466,9 @@ export function IngestSettingsSection() {
     const vlmPayload = showVlmSettings
       ? {
           vlm_enabled: pictureDescriptions,
-          vlm_provider: vlmProvider,
-          vlm_model: vlmModel.trim() || undefined,
+          vlm_provider: effectiveVlmProvider,
+          vlm_model:
+            (vlmModel || allVlmOptions[0]?.value || "").trim() || undefined,
           vlm_prompt: vlmPrompt,
           vlm_response_format: vlmResponseFormat,
           vlm_max_tokens: vlmMaxTokens,
@@ -506,6 +536,7 @@ export function IngestSettingsSection() {
         onSuccess: () => {
           setChunkValidationError(null);
           setValidationError(null);
+          setUserEdited(false);
         },
       },
     );
@@ -559,6 +590,7 @@ export function IngestSettingsSection() {
         setPictureDescriptions(DEFAULT_KNOWLEDGE_SETTINGS.picture_descriptions);
         setDisableIngestWithLangflow(false);
         setChunkValidationError(null);
+        setUserEdited(false);
         toast.success("Default ingest flow settings restored successfully");
         closeDialog();
       })
@@ -640,22 +672,60 @@ export function IngestSettingsSection() {
         <div className="space-y-6">
           <div className="space-y-2">
             <LabelWrapper
-              helperText="Saves immediately when you select a model"
+              helperText={
+                needsExplicitEmbeddingModel
+                  ? undefined
+                  : "Saves immediately when you select a model"
+              }
+              description={
+                needsExplicitEmbeddingModel
+                  ? "Select or enter an Azure deployment name before ingesting files"
+                  : undefined
+              }
               id="embedding-model-select"
               label="Embedding model"
               required={true}
             >
               <ModelSelector
                 groupedOptions={groupedEmbeddingModels}
+                custom
                 noOptionsPlaceholder={
                   isLoadingAnyEmbeddingModels
                     ? "Loading models..."
-                    : "No embedding models detected. Configure a provider first."
+                    : catalogError
+                      ? "Could not load the model catalogue. Retry later."
+                      : "No embedding models detected. Configure a provider first."
                 }
                 value={settings.knowledge?.embedding_model || ""}
+                selectedProvider={settings.knowledge?.embedding_provider}
                 onValueChange={handleEmbeddingModelChange}
+                searchPlaceholder={
+                  requiresExplicitModelSelection(
+                    settings.knowledge?.embedding_provider,
+                  )
+                    ? "Search models or type Azure deployment name"
+                    : undefined
+                }
+                hasError={needsExplicitEmbeddingModel}
               />
             </LabelWrapper>
+            {settings.knowledge?.embedding_model && selectedEmbeddingGroup && (
+              <div className="mt-3">
+                <ModelFeatures
+                  model={
+                    selectedEmbedding?.model ?? {
+                      model: settings.knowledge.embedding_model,
+                      // Without an explicit mode the panel treats an
+                      // off-catalogue embedding model as a language model and
+                      // warns that it cannot run the agent tools.
+                      mode: "embedding",
+                    }
+                  }
+                  providerName={selectedEmbeddingGroup.group}
+                  provider={selectedEmbeddingGroup.provider}
+                />
+              </div>
+            )}
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
@@ -771,7 +841,10 @@ export function IngestSettingsSection() {
               <Switch
                 id="disable-ingest-with-langflow"
                 checked={disableIngestWithLangflow}
-                onCheckedChange={setDisableIngestWithLangflow}
+                onCheckedChange={(v) => {
+                  setUserEdited(true);
+                  setDisableIngestWithLangflow(v);
+                }}
               />
             </div>
             <div className="flex items-center justify-between py-3 border-b border-border">
@@ -789,7 +862,10 @@ export function IngestSettingsSection() {
               <Switch
                 id="table-structure"
                 checked={tableStructure}
-                onCheckedChange={setTableStructure}
+                onCheckedChange={(v) => {
+                  setUserEdited(true);
+                  setTableStructure(v);
+                }}
               />
             </div>
             <div className="flex items-center justify-between py-3 border-b border-border">
@@ -804,7 +880,14 @@ export function IngestSettingsSection() {
                   Extracts text from images/PDFs. Ingest is slower when enabled.
                 </div>
               </div>
-              <Switch id="ocr" checked={ocr} onCheckedChange={setOcr} />
+              <Switch
+                id="ocr"
+                checked={ocr}
+                onCheckedChange={(v) => {
+                  setUserEdited(true);
+                  setOcr(v);
+                }}
+              />
             </div>
             <div className="flex items-center justify-between py-3">
               <div className="flex-1">
@@ -821,165 +904,187 @@ export function IngestSettingsSection() {
               <Switch
                 id="picture-descriptions"
                 checked={pictureDescriptions}
-                onCheckedChange={setPictureDescriptions}
+                onCheckedChange={(v) => {
+                  setUserEdited(true);
+                  setPictureDescriptions(v);
+                }}
               />
             </div>
             {showVlmSettings && (
-              <div
-                className={cn(
-                  "mt-4 border border-border rounded-lg bg-muted/5 overflow-hidden transition-all duration-200",
-                  !pictureDescriptions &&
-                    "opacity-50 cursor-not-allowed select-none",
-                )}
-              >
-                <Accordion
-                  type="single"
-                  collapsible
-                  disabled={!pictureDescriptions}
-                  value={pictureDescriptions ? vlmAccordionValue : ""}
-                  onValueChange={setVlmAccordionValue}
+              <>
+                <hr className="mt-4 border-border" />
+                <Collapsible
+                  open={vlmOpen}
+                  onOpenChange={setVlmOpen}
+                  className={cn(
+                    "mt-4 px-4 transition-all duration-200",
+                    !pictureDescriptions && "opacity-50",
+                  )}
                 >
-                  <AccordionItem value="vlm-settings" className="border-none">
-                    <AccordionTrigger
+                  <CollapsibleTrigger className="flex w-full items-center justify-between py-2 text-sm font-medium text-foreground hover:text-foreground/80">
+                    Advanced Vision Model (VLM) Settings
+                    <ChevronDown
                       className={cn(
-                        "hover:no-underline font-medium text-foreground px-4 py-3 bg-muted/10 border-b border-border",
-                        !pictureDescriptions && "pointer-events-none",
+                        "h-4 w-4 text-muted-foreground transition-transform duration-200",
+                        vlmOpen && "rotate-180",
                       )}
-                    >
-                      Advanced Vision Model (VLM) Settings
-                    </AccordionTrigger>
-                    <AccordionContent className="p-4 space-y-6">
-                      <div className="space-y-2">
-                        <LabelWrapper
-                          id="vlm-model"
-                          label="Vision model"
-                          helperText="Pick a vision-capable model; the provider is set from your selection"
-                          required={pictureDescriptions}
-                        >
-                          <ModelSelector
-                            groupedOptions={groupedVlmModels}
-                            noOptionsPlaceholder={
-                              isLoadingAnyVlmModels
-                                ? "Loading models..."
-                                : "No models detected. Configure OpenAI, Anthropic, Ollama, or IBM watsonx.ai first."
-                            }
-                            value={vlmModel}
-                            onValueChange={handleVlmModelChange}
-                            hasError={!!validationError}
-                          />
-                        </LabelWrapper>
-                        {providerWarning && (
-                          <p className="text-sm text-destructive" role="alert">
-                            {providerLabel} is not configured. Configure it in
-                            Settings &gt; Providers first.
-                          </p>
-                        )}
-                      </div>
-
-                      {vlmProvider === "watsonx" && (
-                        <div className="space-y-2">
-                          <LabelWrapper
-                            id="vlm-watsonx-api-version"
-                            label="watsonx API version"
-                            helperText="API version date sent to watsonx.ai"
-                          >
-                            <Input
-                              id="vlm-watsonx-api-version"
-                              type="text"
-                              placeholder={DEFAULT_WATSONX_API_VERSION}
-                              value={vlmWatsonxApiVersion}
-                              onChange={(e) =>
-                                setVlmWatsonxApiVersion(e.target.value)
-                              }
-                            />
-                          </LabelWrapper>
-                        </div>
-                      )}
-
-                      <div className="space-y-2">
-                        <LabelWrapper
-                          id="vlm-prompt"
-                          label="Prompt"
-                          helperText="Sent to the VLM for every page"
-                        >
-                          <Textarea
-                            id="vlm-prompt"
-                            rows={3}
-                            value={vlmPrompt}
-                            onChange={(e) => setVlmPrompt(e.target.value)}
-                          />
-                        </LabelWrapper>
-                      </div>
-
-                      <div className="space-y-2">
-                        <LabelWrapper
-                          id="vlm-response-format"
-                          label="Response format"
-                          helperText="Per-page VLM output. Markdown is compatible with the existing pipeline; the final document is always Docling JSON."
-                        >
-                          <Select
-                            value={vlmResponseFormat}
-                            onValueChange={setVlmResponseFormat}
-                          >
-                            <SelectTrigger id="vlm-response-format">
-                              <SelectValue placeholder="Select a format" />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {RESPONSE_FORMATS.map((format) => (
-                                <SelectItem
-                                  key={format.value}
-                                  value={format.value}
-                                >
-                                  {format.label}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </LabelWrapper>
-                      </div>
-
-                      <div className="grid grid-cols-3 gap-4">
-                        <NumberInput
-                          id="vlm-max-tokens"
-                          label="Max tokens per page"
-                          value={vlmMaxTokens}
-                          onChange={(value) =>
-                            setVlmMaxTokens(Math.max(1, value))
+                    />
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="pt-4 space-y-6">
+                    <div className="space-y-2">
+                      <LabelWrapper
+                        id="vlm-model"
+                        label="Vision model"
+                        helperText="Pick a vision-capable model; the provider is set from your selection"
+                        required={pictureDescriptions}
+                      >
+                        <ModelSelector
+                          groupedOptions={groupedVlmModels}
+                          custom
+                          noOptionsPlaceholder={
+                            isLoadingAnyVlmModels
+                              ? "Loading models..."
+                              : catalogError
+                                ? "Could not load the model catalogue. Retry later."
+                                : "No models detected. Configure a model provider with vision-capable models first."
                           }
-                          unit="tokens"
-                          min={1}
+                          value={vlmModel}
+                          selectedProvider={effectiveVlmProvider}
+                          onValueChange={handleVlmModelChange}
+                          hasError={!!validationError}
+                          disabled={!pictureDescriptions}
                         />
-                        <NumberInput
-                          id="vlm-concurrency"
-                          label="Concurrency"
-                          value={vlmConcurrency}
-                          onChange={(value) =>
-                            setVlmConcurrency(Math.max(1, value))
-                          }
-                          unit="requests"
-                          min={1}
-                        />
-                        <NumberInput
-                          id="vlm-timeout"
-                          label="API timeout"
-                          value={vlmTimeout}
-                          onChange={(value) =>
-                            setVlmTimeout(Math.max(1, value))
-                          }
-                          unit="seconds"
-                          min={1}
-                        />
-                      </div>
-
-                      {validationError && (
+                      </LabelWrapper>
+                      {providerWarning && (
                         <p className="text-sm text-destructive" role="alert">
-                          {validationError}
+                          Configure a provider with vision-capable models in
+                          Settings &gt; Providers first.
                         </p>
                       )}
-                    </AccordionContent>
-                  </AccordionItem>
-                </Accordion>
-              </div>
+                    </div>
+
+                    {effectiveVlmProvider === "watsonx" && (
+                      <div className="space-y-2">
+                        <LabelWrapper
+                          id="vlm-watsonx-api-version"
+                          label="watsonx API version"
+                          helperText="API version date sent to watsonx.ai"
+                        >
+                          <Input
+                            id="vlm-watsonx-api-version"
+                            type="text"
+                            placeholder={DEFAULT_WATSONX_API_VERSION}
+                            value={vlmWatsonxApiVersion}
+                            onChange={(e) => {
+                              setUserEdited(true);
+                              setVlmWatsonxApiVersion(e.target.value);
+                            }}
+                            disabled={!pictureDescriptions}
+                          />
+                        </LabelWrapper>
+                      </div>
+                    )}
+
+                    <div className="space-y-2">
+                      <LabelWrapper
+                        id="vlm-prompt"
+                        label="Prompt"
+                        helperText="Sent to the VLM for every page"
+                      >
+                        <Textarea
+                          id="vlm-prompt"
+                          rows={3}
+                          value={vlmPrompt}
+                          onChange={(e) => {
+                            setUserEdited(true);
+                            setVlmPrompt(e.target.value);
+                          }}
+                          disabled={!pictureDescriptions}
+                        />
+                      </LabelWrapper>
+                    </div>
+
+                    <div className="space-y-2">
+                      <LabelWrapper
+                        id="vlm-response-format"
+                        label="Response format"
+                        helperText="Per-page VLM output. Markdown is compatible with the existing pipeline; the final document is always Docling JSON."
+                      >
+                        <Select
+                          value={vlmResponseFormat}
+                          onValueChange={(v) => {
+                            setUserEdited(true);
+                            setVlmResponseFormat(v);
+                          }}
+                          disabled={!pictureDescriptions}
+                        >
+                          <SelectTrigger
+                            id="vlm-response-format"
+                            disabled={!pictureDescriptions}
+                          >
+                            <SelectValue placeholder="Select a format" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {RESPONSE_FORMATS.map((format) => (
+                              <SelectItem
+                                key={format.value}
+                                value={format.value}
+                              >
+                                {format.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </LabelWrapper>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-4">
+                      <NumberInput
+                        id="vlm-max-tokens"
+                        label="Max tokens per page"
+                        value={vlmMaxTokens}
+                        onChange={(value) => {
+                          setUserEdited(true);
+                          setVlmMaxTokens(Math.max(1, value));
+                        }}
+                        unit="tokens"
+                        min={1}
+                        disabled={!pictureDescriptions}
+                      />
+                      <NumberInput
+                        id="vlm-concurrency"
+                        label="Concurrency"
+                        value={vlmConcurrency}
+                        onChange={(value) => {
+                          setUserEdited(true);
+                          setVlmConcurrency(Math.max(1, value));
+                        }}
+                        unit="requests"
+                        min={1}
+                        disabled={!pictureDescriptions}
+                      />
+                      <NumberInput
+                        id="vlm-timeout"
+                        label="API timeout"
+                        value={vlmTimeout}
+                        onChange={(value) => {
+                          setUserEdited(true);
+                          setVlmTimeout(Math.max(1, value));
+                        }}
+                        unit="seconds"
+                        min={1}
+                        disabled={!pictureDescriptions}
+                      />
+                    </div>
+
+                    {validationError && (
+                      <p className="text-sm text-destructive" role="alert">
+                        {validationError}
+                      </p>
+                    )}
+                  </CollapsibleContent>
+                </Collapsible>
+              </>
             )}
           </div>
           <div className="flex justify-end pt-2">

@@ -1,14 +1,19 @@
 "use client";
 
 import {
-  AlertCircle,
   Bell,
   CheckCircle,
+  ChevronDown,
   Clock,
   Loader2,
+  X,
   XCircle,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useDeleteAllTerminalTasksMutation,
+  useDeleteTaskMutation,
+} from "@/app/api/mutations/useDeleteTaskMutation";
 import { IncidentReporterIcon } from "@/components/icons/incident-reporter-icon";
 import { TaskCollapsibleSection } from "@/components/task-collapsible-section";
 import { TaskErrorContent } from "@/components/task-error-content";
@@ -28,12 +33,13 @@ import {
 } from "@/components/ui/card";
 import { useIsCloudBrand } from "@/contexts/brand-context";
 import { Task, useTask } from "@/contexts/task-context";
+import { formatRelative } from "@/lib/status-utils";
+import { hasIssueFileEntries, isCompletedTotalFailure } from "@/lib/task-utils";
 import {
-  hasIssueFileEntries,
-  isCompletedTotalFailure,
-  isTerminalFailedTask,
-} from "@/lib/task-utils";
-import { parseTimestampMs } from "@/lib/time-utils";
+  formatTaskTimestamp,
+  parseTimestamp,
+  parseTimestampMs,
+} from "@/lib/time-utils";
 import { cn } from "@/lib/utils";
 
 const getTaskIcon = (
@@ -47,12 +53,14 @@ const getTaskIcon = (
         if (isTotalFailure) {
           return <XCircle className="size-4 text-destructive" />;
         }
-        return <AlertCircle className="h-4 w-4 text-brand-amber" />;
+        return <XCircle className="h-4 w-4 text-brand-amber" />;
       }
       return <CheckCircle className="h-4 w-4 text-green-500" />;
     case "failed":
     case "error":
       return <XCircle className="size-4 text-destructive" />;
+    case "cancelled":
+      return <XCircle className="size-4 text-muted-foreground" />;
     case "pending":
       return <Clock className="h-4 w-4 text-yellow-500" />;
     case "running":
@@ -106,34 +114,125 @@ const formatDuration = (seconds?: number) => {
   }
 };
 
-const formatRelativeTime = (dateString: string) => {
-  let date: Date;
+// ─── status badge ─────────────────────────────────────────────────────────────
 
-  if (/^\d+$/.test(dateString)) {
-    const timestamp = parseInt(dateString);
-    date = new Date(timestamp < 10000000000 ? timestamp * 1000 : timestamp);
-  } else if (/^\d+\.\d+$/.test(dateString)) {
-    const timestamp = parseFloat(dateString);
-    date = new Date(timestamp * 1000);
-  } else {
-    date = new Date(dateString);
+const getStatusBadge = (
+  status: Task["status"],
+  isCloudBrand: boolean,
+  hasFailedFiles = false,
+  isTotalFailure = false,
+) => {
+  const statusBadgeBase = "shrink-0 rounded-full px-2 py-1 text-xs font-normal";
+  switch (status) {
+    case "completed":
+      if (hasFailedFiles && isTotalFailure) {
+        return (
+          <Badge
+            variant="outline"
+            className={cn(
+              statusBadgeBase,
+              isCloudBrand
+                ? "border-0 bg-task-status-failed text-task-status-failed-foreground"
+                : "bg-red-500/10 text-red-500 border-red-500/20",
+            )}
+          >
+            FAILED
+          </Badge>
+        );
+      }
+      if (hasFailedFiles) {
+        return (
+          <Badge
+            variant="outline"
+            className={cn(
+              statusBadgeBase,
+              isCloudBrand
+                ? "border-0 bg-task-status-partial text-task-status-partial-foreground"
+                : "bg-brand-amber-10 text-brand-amber border-brand-amber-30",
+            )}
+          >
+            Completed
+          </Badge>
+        );
+      }
+      return (
+        <Badge
+          variant="outline"
+          className={cn(
+            statusBadgeBase,
+            isCloudBrand
+              ? "border-0 bg-task-status-complete text-task-status-complete-foreground"
+              : "border border-green-500/20 bg-green-500/10 text-green-500",
+          )}
+        >
+          Completed
+        </Badge>
+      );
+    case "failed":
+    case "error":
+      return (
+        <Badge
+          variant="outline"
+          className={cn(
+            statusBadgeBase,
+            isCloudBrand
+              ? "border-0 bg-task-status-failed text-task-status-failed-foreground"
+              : "bg-red-500/10 text-red-500 border-red-500/20",
+          )}
+        >
+          FAILED
+        </Badge>
+      );
+    case "cancelled":
+      return (
+        <Badge
+          variant="outline"
+          className={cn(
+            statusBadgeBase,
+            "bg-muted text-muted-foreground border-muted-foreground/20",
+          )}
+        >
+          CANCELLED
+        </Badge>
+      );
+    case "pending":
+      return (
+        <Badge
+          variant="outline"
+          className={cn(
+            statusBadgeBase,
+            "bg-yellow-500/10 text-yellow-500 border-yellow-500/20",
+          )}
+        >
+          Pending
+        </Badge>
+      );
+    case "running":
+    case "processing":
+      return (
+        <Badge
+          variant="outline"
+          className={cn(
+            statusBadgeBase,
+            "bg-blue-500/10 text-blue-500 border-blue-500/20",
+          )}
+        >
+          Processing
+        </Badge>
+      );
+    default:
+      return (
+        <Badge
+          variant="outline"
+          className={cn(
+            statusBadgeBase,
+            "bg-gray-500/10 text-gray-500 border-gray-500/20",
+          )}
+        >
+          Unknown
+        </Badge>
+      );
   }
-
-  if (isNaN(date.getTime())) {
-    console.warn("Invalid date format:", dateString);
-    return "Unknown time";
-  }
-
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMinutes = Math.floor(diffMs / 60000);
-  const diffHours = Math.floor(diffMs / 3600000);
-  const diffDays = Math.floor(diffMs / 86400000);
-
-  if (diffMinutes < 1) return "Just now";
-  if (diffMinutes < 60) return `${diffMinutes}m ago`;
-  if (diffHours < 24) return `${diffHours}h ago`;
-  return `${diffDays}d ago`;
 };
 
 export function TaskNotificationMenu() {
@@ -149,7 +248,12 @@ export function TaskNotificationMenu() {
     closeMenu,
     openTaskDialog,
   } = useTask();
+  const deleteTaskMutation = useDeleteTaskMutation();
+  const deleteAllMutation = useDeleteAllTerminalTasksMutation();
   const [isPastOpen, setIsPastOpen] = useState(true);
+  const [cancellingTaskIds, setCancellingTaskIds] = useState<Set<string>>(
+    new Set(),
+  );
   const lastHandledSelectionTriggerRef = useRef(0);
 
   // Reset section defaults whenever panel is opened.
@@ -165,6 +269,40 @@ export function TaskNotificationMenu() {
       setIsPastOpen(true);
     }
   }, [isRecentTasksExpanded]);
+
+  // Clean up cancelling state when tasks actually transition to cancelled or disappear
+  useEffect(() => {
+    const currentTaskIds = new Set<string>();
+    const terminalTaskIds = new Set<string>();
+
+    // Single pass over tasks to build both sets
+    for (const task of tasks) {
+      currentTaskIds.add(task.task_id);
+      if (
+        task.status === "cancelled" ||
+        task.status === "failed" ||
+        task.status === "completed" ||
+        task.status === "error"
+      ) {
+        terminalTaskIds.add(task.task_id);
+      }
+    }
+
+    setCancellingTaskIds((prev) => {
+      const next = new Set(prev);
+      let changed = false;
+
+      // Remove from cancelling set if task is now terminal or disappeared
+      for (const id of next) {
+        if (!currentTaskIds.has(id) || terminalTaskIds.has(id)) {
+          next.delete(id);
+          changed = true;
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [tasks]);
   const activeTasks = tasks.filter(
     (task) =>
       task.status === "pending" ||
@@ -178,7 +316,8 @@ export function TaskNotificationMenu() {
           (task) =>
             task.status === "completed" ||
             task.status === "failed" ||
-            task.status === "error",
+            task.status === "error" ||
+            task.status === "cancelled",
         )
         .sort((a, b) => {
           const aMs =
@@ -215,113 +354,6 @@ export function TaskNotificationMenu() {
     isCloudBrand ? "border-t border-muted" : "rounded-mmd border border-muted",
   );
 
-  const statusBadgeBase = "shrink-0 rounded-full px-2 py-1 text-xs font-normal";
-
-  const getStatusBadge = (
-    status: Task["status"],
-    hasFailedFiles = false,
-    isTotalFailure = false,
-  ) => {
-    switch (status) {
-      case "completed":
-        if (hasFailedFiles && isTotalFailure) {
-          return (
-            <Badge
-              variant="outline"
-              className={cn(
-                statusBadgeBase,
-                isCloudBrand
-                  ? "border-0 bg-task-status-failed text-task-status-failed-foreground"
-                  : "bg-red-500/10 text-red-500 border-red-500/20",
-              )}
-            >
-              FAILED
-            </Badge>
-          );
-        }
-        if (hasFailedFiles) {
-          return (
-            <Badge
-              variant="outline"
-              className={cn(
-                statusBadgeBase,
-                isCloudBrand
-                  ? "border-0 bg-task-status-partial text-task-status-partial-foreground"
-                  : "bg-brand-amber-10 text-brand-amber border-brand-amber-30",
-              )}
-            >
-              Complete
-            </Badge>
-          );
-        }
-        return (
-          <Badge
-            variant="outline"
-            className={cn(
-              statusBadgeBase,
-              isCloudBrand
-                ? "border-0 bg-task-status-complete text-task-status-complete-foreground"
-                : "border border-green-500/20 bg-green-500/10 text-green-500",
-            )}
-          >
-            Complete
-          </Badge>
-        );
-      case "failed":
-      case "error":
-        return (
-          <Badge
-            variant="outline"
-            className={cn(
-              statusBadgeBase,
-              isCloudBrand
-                ? "border-0 bg-task-status-failed text-task-status-failed-foreground"
-                : "bg-red-500/10 text-red-500 border-red-500/20",
-            )}
-          >
-            FAILED
-          </Badge>
-        );
-      case "pending":
-        return (
-          <Badge
-            variant="outline"
-            className={cn(
-              statusBadgeBase,
-              "bg-yellow-500/10 text-yellow-500 border-yellow-500/20",
-            )}
-          >
-            Pending
-          </Badge>
-        );
-      case "running":
-      case "processing":
-        return (
-          <Badge
-            variant="outline"
-            className={cn(
-              statusBadgeBase,
-              "bg-blue-500/10 text-blue-500 border-blue-500/20",
-            )}
-          >
-            Processing
-          </Badge>
-        );
-      default:
-        return (
-          <Badge
-            variant="outline"
-            className={cn(
-              statusBadgeBase,
-              "bg-gray-500/10 text-gray-500 border-gray-500/20",
-            )}
-          >
-            Unknown
-          </Badge>
-        );
-    }
-  };
-
   const cancelTaskButtonClass = cn(
     "h-10 w-full shrink-0 shadow-none",
     isCloudBrand
@@ -336,8 +368,10 @@ export function TaskNotificationMenu() {
       <div className="flex flex-col h-full">
         <TaskPanelHeader
           activeCount={activeTasks.length}
+          terminalCount={terminalTasks.filter((t) => !t.is_shared).length}
           isFetching={isFetching}
           onClose={closeMenu}
+          onClearAll={() => deleteAllMutation.mutate()}
         />
 
         {/* Content */}
@@ -351,10 +385,15 @@ export function TaskNotificationMenu() {
               {activeTasks.map((task) => {
                 const progress = formatTaskProgress(task);
                 const hasFailedFiles = hasIssueFileEntries(task);
-                const showCancel =
-                  task.status === "pending" ||
-                  task.status === "running" ||
-                  task.status === "processing";
+                const dur = formatDuration(task.duration_seconds);
+                const isCancelling = cancellingTaskIds.has(task.task_id);
+                const isCancelled = task.status === "cancelled";
+                const canCancel =
+                  !isCancelling &&
+                  !isCancelled &&
+                  (task.status === "pending" ||
+                    task.status === "running" ||
+                    task.status === "processing");
                 const showTaskIcon =
                   !isCloudBrand ||
                   task.status !== "completed" ||
@@ -368,13 +407,25 @@ export function TaskNotificationMenu() {
                     <CardHeader className="p-0 pb-2">
                       <div className="flex items-center justify-between gap-2">
                         <CardTitle className="text-sm flex min-w-0 flex-1 items-center gap-2">
-                          {showTaskIcon &&
-                            getTaskIcon(
-                              task.status,
-                              hasFailedFiles,
-                              isCompletedTotalFailure(task),
-                            )}
-                          Task {task.task_id.substring(0, 8)}...
+                          {isCancelling ? (
+                            <span className="text-xs text-destructive font-medium">
+                              CANCELLING...
+                            </span>
+                          ) : isCancelled ? (
+                            <span className="text-xs text-muted-foreground font-medium">
+                              CANCELLED
+                            </span>
+                          ) : (
+                            <>
+                              {showTaskIcon &&
+                                getTaskIcon(
+                                  task.status,
+                                  hasFailedFiles,
+                                  isCompletedTotalFailure(task),
+                                )}
+                              Task {task.task_id.substring(0, 8)}...
+                            </>
+                          )}
                         </CardTitle>
                         <button
                           type="button"
@@ -386,17 +437,17 @@ export function TaskNotificationMenu() {
                         </button>
                       </div>
                       <CardDescription className="text-xs">
-                        Started {formatRelativeTime(task.created_at)}
-                        {formatDuration(task.duration_seconds) && (
+                        Started {formatRelative(task.created_at)}
+                        {dur && (
                           <span className="ml-2 text-muted-foreground">
-                            • {formatDuration(task.duration_seconds)}
+                            • {dur}
                           </span>
                         )}
                       </CardDescription>
                     </CardHeader>
-                    {(progress || showCancel) && (
+                    {(progress || canCancel || isCancelling || isCancelled) && (
                       <CardContent className="p-0 pt-0">
-                        {progress && (
+                        {progress && !isCancelling && !isCancelled && (
                           <div className="space-y-2">
                             <div className="text-xs text-muted-foreground">
                               Progress: {progress.basic}
@@ -409,17 +460,57 @@ export function TaskNotificationMenu() {
                             )}
                           </div>
                         )}
-                        {showCancel && (
-                          <div className={cn(progress && "mt-3")}>
+                        {(canCancel || isCancelling || isCancelled) && (
+                          <div
+                            className={cn(
+                              progress &&
+                                !isCancelling &&
+                                !isCancelled &&
+                                "mt-3",
+                            )}
+                          >
                             <Button
                               type="button"
                               variant="ghost"
                               ignoreTitleCase
-                              onClick={() => cancelTask(task.task_id)}
-                              title="Cancel task"
-                              className={cancelTaskButtonClass}
+                              disabled={isCancelling || isCancelled}
+                              onClick={async () => {
+                                if (canCancel) {
+                                  setCancellingTaskIds((prev) =>
+                                    new Set(prev).add(task.task_id),
+                                  );
+                                  try {
+                                    await cancelTask(task.task_id);
+                                    // Don't remove from cancellingTaskIds here - let the useEffect clean it up
+                                    // when the backend actually returns "cancelled" status
+                                  } catch (error) {
+                                    // On error, remove from cancelling set immediately
+                                    setCancellingTaskIds((prev) => {
+                                      const next = new Set(prev);
+                                      next.delete(task.task_id);
+                                      return next;
+                                    });
+                                  }
+                                }
+                              }}
+                              title={
+                                isCancelled
+                                  ? "Task cancelled"
+                                  : isCancelling
+                                    ? "Cancelling..."
+                                    : "Cancel task"
+                              }
+                              className={cn(
+                                cancelTaskButtonClass,
+                                (isCancelling || isCancelled) &&
+                                  "opacity-50 cursor-not-allowed",
+                              )}
                             >
-                              Cancel task
+                              {isCancelled
+                                ? "Cancelled"
+                                : isCancelling
+                                  ? "Cancelling..."
+                                  : "Cancel task"}
                             </Button>
                           </div>
                         )}
@@ -467,28 +558,45 @@ export function TaskNotificationMenu() {
                 const isTotalFailure = isCompletedTotalFailure(task);
                 const shouldExpandDetails = selectedTaskId === task.task_id;
 
-                // Same full card as total failure; partial only differs inside (Complete pill / amber icon).
+                // Render detailed failure content only when file-level details exist.
                 if (
-                  isTerminalFailedTask(task) ||
-                  isTotalFailure ||
-                  hasFailedFiles
+                  task.status !== "cancelled" &&
+                  (isTotalFailure || hasFailedFiles)
                 ) {
                   return (
-                    <TaskErrorContent
-                      key={
-                        shouldExpandDetails
-                          ? `${task.task_id}-${selectedTaskTrigger}`
-                          : task.task_id
-                      }
-                      task={task}
-                      mode="past"
-                      defaultExpanded={shouldExpandDetails}
-                    />
+                    <div key={task.task_id} className="group/row">
+                      <TaskErrorContent
+                        key={
+                          shouldExpandDetails
+                            ? `${task.task_id}-${selectedTaskTrigger}`
+                            : task.task_id
+                        }
+                        task={task}
+                        mode="past"
+                        defaultExpanded={shouldExpandDetails}
+                        headerEnd={
+                          <button
+                            type="button"
+                            aria-label="Delete task"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              deleteTaskMutation.mutate(task.task_id);
+                            }}
+                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground opacity-100 hover:bg-muted hover:text-foreground transition-colors focus-visible:ring-1 focus-visible:ring-ring"
+                          >
+                            <X className="size-4" />
+                          </button>
+                        }
+                      />
+                    </div>
                   );
                 }
 
                 return (
-                  <div key={task.task_id} className={pastTaskRowClass}>
+                  <div
+                    key={task.task_id}
+                    className={`${pastTaskRowClass} group/row`}
+                  >
                     <div className="flex items-start gap-3">
                       {!isCloudBrand && getTaskIcon(task.status)}
                       <div className="flex-1 min-w-0">
@@ -496,11 +604,10 @@ export function TaskNotificationMenu() {
                           Task {task.task_id.substring(0, 8)}...
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          {formatRelativeTime(task.updated_at)}
-                          {formatDuration(task.duration_seconds) && (
-                            <span className="ml-2">
-                              • {formatDuration(task.duration_seconds)}
-                            </span>
+                          {formatTaskTimestamp(
+                            parseTimestamp(task.updated_at),
+                            "past",
+                            Date.now(),
                           )}
                         </div>
                         {task.status === "completed" && progress?.detailed && (
@@ -513,8 +620,19 @@ export function TaskNotificationMenu() {
                           </div>
                         )}
                       </div>
-                      <div className="self-start pt-0.5">
-                        {getStatusBadge(task.status)}
+                      <div className="self-start pt-0.5 flex items-center gap-1.5 shrink-0">
+                        {getStatusBadge(task.status, isCloudBrand)}
+                        <button
+                          type="button"
+                          aria-label="Delete task"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            deleteTaskMutation.mutate(task.task_id);
+                          }}
+                          className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground opacity-100 hover:bg-muted hover:text-foreground transition-colors focus-visible:ring-1 focus-visible:ring-ring"
+                        >
+                          <X className="size-4" />
+                        </button>
                       </div>
                     </div>
                   </div>

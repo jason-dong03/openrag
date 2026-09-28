@@ -3,6 +3,7 @@
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter } from "@/components/ui/dialog";
 import { useIsCloudBrand } from "@/contexts/brand-context";
+import { useTask } from "@/contexts/task-context";
 import { cn } from "@/lib/utils";
 import { TaskDialogFileList } from "./file-list";
 import { TaskDialogHeader } from "./header";
@@ -21,6 +22,7 @@ function TaskDialogContent({
   onClose,
 }: Pick<TaskDialogProps, "open" | "task_id" | "onClose">) {
   const isCloudBrand = useIsCloudBrand();
+  const { cancelFile } = useTask();
   const {
     task,
     isLoading,
@@ -122,13 +124,14 @@ function TaskDialogContent({
             selectedCount={selectedCount}
             retryIngestionSelectedCount={retryIngestionSelectedCount}
             retryingTarget={retryingTarget}
+            onCancelFile={cancelFile}
           />
         )}
       </div>
 
       <DialogFooter
         className={cn(
-          "w-full shrink-0 flex-row items-stretch sm:space-x-0",
+          "w-full shrink-0 flex-row items-stretch",
           isCloudBrand
             ? "gap-0 border-t bg-layer-contextual p-0"
             : cn(
@@ -143,7 +146,7 @@ function TaskDialogContent({
             className={cn(
               "min-w-0",
               isCloudBrand
-                ? "w-1/2 justify-start rounded-none px-4 text-left"
+                ? "justify-start rounded-none px-4 text-left"
                 : "flex-1",
             )}
             disabled={isRetrying || !task}
@@ -158,7 +161,7 @@ function TaskDialogContent({
             className={cn(
               "min-w-0",
               isCloudBrand
-                ? "w-1/2 justify-start rounded-none px-4 text-left"
+                ? "justify-start rounded-none px-4 text-left"
                 : "flex-1",
             )}
             disabled={isRetrying || !task}
@@ -173,9 +176,11 @@ function TaskDialogContent({
           ignoreTitleCase
           className={cn(
             isCloudBrand
-              ? "w-1/2 shrink-0 justify-start rounded-none px-4 text-left"
+              ? cn(
+                  "shrink-0 justify-start rounded-none px-4 text-left",
+                  isCancelOnly && "col-span-2",
+                )
               : "shrink-0",
-            isCloudBrand && showRetryActions && "ml-auto",
           )}
           onClick={onClose}
           disabled={isRetrying}

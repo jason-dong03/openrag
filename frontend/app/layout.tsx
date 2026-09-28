@@ -9,8 +9,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider } from "@/contexts/auth-context";
 import { BrandProvider } from "@/contexts/brand-context";
 import { ChatProvider } from "@/contexts/chat-context";
+import { ConsoleStatusProvider } from "@/contexts/console-status-context";
 import { KnowledgeFilterProvider } from "@/contexts/knowledge-filter-context";
+import { SidebarOverlayProvider } from "@/contexts/sidebar-overlay-context";
 import { TaskProvider } from "@/contexts/task-context";
+import { UnsavedChangesProvider } from "@/contexts/unsaved-changes-context";
 import Providers from "./providers";
 
 const inter = Inter({
@@ -55,15 +58,21 @@ export default function RootLayout({
           disableTransitionOnChange
         >
           <Providers>
-            <Analytics />
             <TooltipProvider>
               <AuthProvider>
+                <Analytics />
                 <BrandProvider>
                   <TaskProvider>
                     <KnowledgeFilterProvider>
-                      <ChatProvider>
-                        <LayoutWrapper>{children}</LayoutWrapper>
-                      </ChatProvider>
+                      <ConsoleStatusProvider>
+                        <ChatProvider>
+                          <UnsavedChangesProvider>
+                            <SidebarOverlayProvider>
+                              <LayoutWrapper>{children}</LayoutWrapper>
+                            </SidebarOverlayProvider>
+                          </UnsavedChangesProvider>
+                        </ChatProvider>
+                      </ConsoleStatusProvider>
                     </KnowledgeFilterProvider>
                   </TaskProvider>
                 </BrandProvider>

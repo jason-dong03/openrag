@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 
 from models.tasks import DoclingPhaseStatus, FileTask, IngestionPhase, TaskStatus, UploadTask
-from services.task_service import TaskService
+from services.task_service import TaskService, _opensearch_failure_metadata
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -123,6 +123,62 @@ class TestInferFailureMetadata:
         assert meta is not None
         assert meta["actionable_by"] == "USER_ACTIONABLE"
 
+    def test_password_protected_pdf_maps_to_clean_message(self, task_service):
+        ft = _make_file_task(
+            docling_status=DoclingPhaseStatus.FAILED,
+            error=(
+                "Docling conversion did not complete (failed): "
+                "Docling result unavailable after SUCCESS status: Docling processing "
+                "failed: docling-parse could not load document "
+                "cbfc231c73e85df69b34cfa56b4bb0696dc0f10d0536bcca821f92c324041bac: "
+                "Failed to load document (PDFium: Incorrect password error)."
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        msg = meta["user_facing_message"]
+        assert "password-protected" in msg.lower()
+        assert "not supported" in msg.lower()
+        assert "remove the password" in msg.lower()
+        assert "upload the pdf again" in msg.lower()
+        # no internals leaked
+        assert "pdfium" not in msg.lower()
+        assert "docling-parse" not in msg.lower()
+        assert "cbfc231c" not in msg
+
+    def test_password_protected_pdf_non_langflow_path_maps_to_clean_message(self, task_service):
+        """The non-Langflow path stores DoclingService's error verbatim.
+
+        Unlike the Langflow path above there is no "did not complete" /
+        "result unavailable" wrapper — the string is exactly what
+        DoclingService._poll_result raises once the result body's errors are
+        surfaced. It must map to the same user-facing password message.
+        """
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error=(
+                "Docling processing failed: docling-parse could not load document "
+                "cbfc231c73e85df69b34cfa56b4bb0696dc0f10d0536bcca821f92c324041bac: "
+                "Failed to load document (PDFium: Incorrect password error)."
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        msg = meta["user_facing_message"]
+        assert "password-protected" in msg.lower()
+        assert "remove the password" in msg.lower()
+        # no internals leaked
+        assert "pdfium" not in msg.lower()
+        assert "docling-parse" not in msg.lower()
+        assert "cbfc231c" not in msg
+
     def test_langflow_empty_content_not_retryable(self, task_service):
         ft = _make_file_task(
             phase=IngestionPhase.LANGFLOW,
@@ -132,6 +188,22 @@ class TestInferFailureMetadata:
         meta = task_service._infer_failure_metadata(ft)
         assert meta is not None
         assert meta["actionable_by"] == "USER_ACTIONABLE"
+
+    def test_image_without_text_prompts_user_to_enable_ocr(self, task_service):
+        ft = _make_file_task(
+            file_path="scan.png",
+            filename="scan.png",
+            error="No text content could be extracted from document",
+        )
+
+        meta = task_service._infer_failure_metadata(ft)
+
+        assert meta is not None
+        assert meta["actionable_by"] == "RETRYABLE"
+        assert meta["user_facing_message"] == (
+            "No text content could be extracted from this image file. "
+            "Enable OCR in Settings > Knowledge Base and retry ingestion."
+        )
 
     def test_docling_phase_still_processing(self, task_service):
         ft = _make_file_task(
@@ -169,6 +241,88 @@ class TestInferFailureMetadata:
         assert meta["component"] == "langflow"
         assert meta["failure_phase"] == "unknown"
         assert meta["actionable_by"] == "RETRYABLE"
+
+    def test_langflow_model_not_found_surfaces_specific_message(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=(
+                "Model 'ibm/granite-4-h-small' was not found. "
+                "This model may be unsupported, deprecated, or removed."
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "langflow"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert "granite-4-h-small" in meta["user_facing_message"]
+        assert "unexpectedly" not in meta["user_facing_message"].lower()
+
+    def test_langflow_azure_deployment_missing_is_user_actionable(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error="The API deployment for this resource does not exist.",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "langflow"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["user_facing_message"] == (
+            "The API deployment for this resource does not exist."
+        )
+
+    def test_langflow_revoked_api_key_failure(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=(
+                'Failed to authenticate with IBM Watson: {"errorCode":"BXNIM0415E",'
+                '"errorMessage":"Provided API key could not be found."}'
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "openrag"
+        assert meta["failure_phase"] == "embedding"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert "API key" in meta["user_facing_message"]
+        assert "{" not in meta["user_facing_message"]
+
+    def test_langflow_disabled_api_key_failure(self, task_service):
+        """Disabled (not deleted) IBM keys must not fall through to generic Langflow copy."""
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=(
+                "Error building Component Embedding Model: Failed to initialize IBM "
+                "WatsonX embedding model: Attempt of authenticating connection to "
+                "service failed, please validate your credentials. Error: "
+                '{"errorCode":"BXNIM0420E","errorMessage":"Provided API key is disabled."}'
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "openrag"
+        assert meta["failure_phase"] == "embedding"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert "disabled" in meta["user_facing_message"].lower()
+        assert "unexpectedly" not in meta["user_facing_message"].lower()
+        assert "error building component" not in meta["user_facing_message"].lower()
+        assert "error running graph" not in meta["user_facing_message"].lower()
+        assert "{" not in meta["user_facing_message"]
+
+    def test_langflow_disconnect_with_api_key_text_prefers_credentials(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=("Server disconnected without sending a response. Incorrect API key provided"),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["failure_phase"] == "embedding"
+        assert "API key" in meta["user_facing_message"]
+        assert "connection was lost" not in meta["user_facing_message"].lower()
 
     def test_duplicate_file_error(self, task_service):
         ft = _make_file_task(
@@ -280,6 +434,7 @@ class TestGetTaskStatus2FailureMetadata:
         assert file_entry["component"] == "langflow"
         assert file_entry["failure_phase"] == "unknown"
         assert file_entry["actionable_by"] == "RETRYABLE"
+        assert file_entry["user_facing_message"] == "Langflow run failed"
 
     def test_duplicate_file_failure_adds_metadata(self, task_service):
         ft = _make_file_task(
@@ -546,3 +701,151 @@ class TestGetTaskStatusRegression:
         for key in v1_file:
             assert key in v2_file, f"get_task_status2 file entry missing key: {key}"
             assert v1_file[key] == v2_file[key], f"file entry key '{key}' differs"
+
+
+# ---------------------------------------------------------------------------
+# OpenSearch transport failures
+# ---------------------------------------------------------------------------
+
+
+class TestOpenSearchFailureMetadata:
+    def test_by_query_conflict_is_classified_as_retryable_opensearch_failure(self, task_service):
+        # opensearch-py puts the entire by-query response body into the message,
+        # because that response has no top-level "error" key to use instead.
+        ft = _make_file_task(
+            filename="logo.png",
+            phase=IngestionPhase.LANGFLOW,
+            error=(
+                'ConflictError(409, \'{"took":2719,"timed_out":false,"total":300,'
+                '"updated":19,"version_conflicts":1,"failures":[{"index":"documents",'
+                '"id":"20","cause":{"type":"version_conflict_engine_exception"}}]}\')'
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "opensearch"
+        assert meta["failure_phase"] == "indexing"
+        assert meta["actionable_by"] == "RETRYABLE"
+        msg = meta["user_facing_message"]
+        assert "retry ingestion" in msg.lower()
+        # The raw payload must not reach the UI.
+        assert "version_conflict_engine_exception" not in msg
+        assert "{" not in msg
+
+    def test_mapper_parsing_body_is_not_read_as_a_corrupt_file(self, task_service):
+        # A 400 body contains the substring "failed to parse", which
+        # _is_non_retryable_file_error would otherwise classify as a corrupt file.
+        ft = _make_file_task(
+            error="RequestError(400, 'mapper_parsing_exception', 'failed to parse field [x]')"
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "opensearch"
+        assert "corrupt" not in meta["user_facing_message"].lower()
+
+    def test_image_without_text_still_gets_the_ocr_guidance(self, task_service):
+        ft = _make_file_task(
+            filename="scan.png",
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error="No text content could be extracted from document",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+        assert "ocr" in meta["user_facing_message"].lower()
+
+    def test_plain_errors_are_left_to_the_existing_branches(self, task_service):
+        ft = _make_file_task(error="Docling conversion did not complete (timeout): 300s")
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+
+
+class TestOpenSearchErrorStringContract:
+    """Pin the opensearch-py rendering the classifier depends on.
+
+    _opensearch_failure_metadata matches the exception's *string form*, which is
+    built by opensearch-py's Connection._raise_error, not by us. If a client
+    upgrade changes that rendering, the classifier silently stops matching and
+    users start seeing raw payloads again. These tests fail loudly instead of
+    letting that regress quietly.
+    """
+
+    def test_by_query_conflict_renders_body_as_the_message(self):
+        from opensearchpy.connection.base import Connection
+        from opensearchpy.exceptions import ConflictError
+
+        # An _update_by_query 409 carries no top-level "error" key, so
+        # _raise_error falls back to using the whole response body as the message.
+        body = (
+            '{"took":12,"timed_out":false,"total":3,"updated":1,'
+            '"version_conflicts":1,"failures":[{"index":"documents","id":"7",'
+            '"cause":{"type":"version_conflict_engine_exception"}}]}'
+        )
+        with pytest.raises(ConflictError) as excinfo:
+            Connection()._raise_error(409, body, "application/json")
+
+        rendered = str(excinfo.value)
+        assert rendered.startswith("ConflictError(409, '{")
+        meta = _opensearch_failure_metadata(rendered)
+        assert meta is not None
+        assert meta["component"] == "opensearch"
+        assert meta["actionable_by"] == "RETRYABLE"
+
+    def test_single_document_conflict_renders_a_short_reason(self):
+        from opensearchpy.connection.base import Connection
+        from opensearchpy.exceptions import ConflictError
+
+        # Single-document writes render differently — a reason string rather than
+        # a JSON body — and must classify identically.
+        body = (
+            '{"error":{"root_cause":[{"type":"version_conflict_engine_exception",'
+            '"reason":"[7]: version conflict"}],'
+            '"type":"version_conflict_engine_exception"},"status":409}'
+        )
+        with pytest.raises(ConflictError) as excinfo:
+            Connection()._raise_error(409, body, "application/json")
+
+        rendered = str(excinfo.value)
+        assert rendered.startswith("ConflictError(409, 'version_conflict_engine_exception'")
+        meta = _opensearch_failure_metadata(rendered)
+        assert meta is not None
+        assert meta["component"] == "opensearch"
+
+    def test_non_opensearch_text_is_not_classified(self):
+        for text in (
+            "",
+            "Docling conversion did not complete (timeout): polling exceeded 300s",
+            "the sync hit a ConflictError while running",  # prose, no (status)
+        ):
+            assert _opensearch_failure_metadata(text) is None
+
+
+class TestGetTaskStatus2OpenSearchFailure:
+    def test_conflict_surfaces_as_structured_metadata(self, task_service):
+        ft = _make_file_task(
+            filename="logo.png",
+            phase=IngestionPhase.LANGFLOW,
+            error=(
+                'ConflictError(409, \'{"took":9,"total":3,"updated":1,'
+                '"version_conflicts":1,"failures":[{"index":"documents","id":"7"}]}\')'
+            ),
+        )
+        task = _make_upload_task("os409", {"logo.png": ft})
+        task.status = TaskStatus.FAILED
+        task.failed_files = 1
+        _store_task(task_service, "user1", task)
+
+        file_entry = task_service.get_task_status2("user1", "os409")["files"]["logo.png"]
+
+        assert file_entry["status"] == "failed"
+        assert file_entry["component"] == "opensearch"
+        assert file_entry["failure_phase"] == "indexing"
+        assert file_entry["actionable_by"] == "RETRYABLE"
+        # The payload must not reach the user as the displayed message...
+        assert "{" not in file_entry["user_facing_message"]
+        assert "version_conflicts" not in file_entry["user_facing_message"]
+        # ...but the raw error stays on the entry, which is the only way to
+        # diagnose which OpenSearch operation actually failed.
+        assert file_entry["error"].startswith("ConflictError(409, '{")

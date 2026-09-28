@@ -9,6 +9,10 @@ import { useGetAnthropicModelsQuery } from "@/app/api/queries/useGetModelsQuery"
 import { useGetSettingsQuery } from "@/app/api/queries/useGetSettingsQuery";
 import type { ProviderHealthResponse } from "@/app/api/queries/useProviderHealthQuery";
 import AnthropicLogo from "@/components/icons/anthropic-logo";
+import {
+  canRemoveProvider,
+  isProviderConfigured,
+} from "@/components/models/model-helpers";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -41,14 +45,12 @@ const AnthropicSettingsDialog = ({
     enabled: isAuthenticated || isNoAuthMode,
   });
 
-  const isAnthropicConfigured =
-    settings.providers?.anthropic?.configured === true;
+  const isAnthropicConfigured = isProviderConfigured(
+    settings.providers,
+    "anthropic",
+  );
 
-  const canRemoveAnthropic =
-    isAnthropicConfigured &&
-    (settings.providers?.openai?.configured === true ||
-      settings.providers?.watsonx?.configured === true ||
-      settings.providers?.ollama?.configured === true);
+  const canRemoveAnthropic = canRemoveProvider(settings.providers, "anthropic");
 
   const methods = useForm<AnthropicSettingsFormData>({
     mode: "onSubmit",
@@ -92,7 +94,7 @@ const AnthropicSettingsDialog = ({
         action: {
           label: "Settings",
           onClick: () => {
-            router.push("/settings/langflow?focusLlmModel=true");
+            router.push("/settings/agent?focusLlmModel=true");
           },
         },
       });
@@ -145,9 +147,12 @@ const AnthropicSettingsDialog = ({
         setOpen(o);
       }}
     >
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-2xl overflow-hidden">
         <FormProvider {...methods}>
-          <form onSubmit={handleSubmit(onSubmit)} className="grid gap-4">
+          <form
+            onSubmit={handleSubmit(onSubmit)}
+            className="grid min-w-0 gap-4"
+          >
             <DialogHeader className="mb-2">
               <DialogTitle className="flex items-center gap-3">
                 <div className="w-8 h-8 rounded flex items-center justify-center bg-white border">
@@ -170,7 +175,7 @@ const AnthropicSettingsDialog = ({
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
                 >
-                  <p className="rounded-lg border border-destructive p-4">
+                  <p className="rounded-lg border border-destructive p-4 min-w-0 [overflow-wrap:anywhere]">
                     {settingsMutation.error?.message}
                   </p>
                 </motion.div>
@@ -182,7 +187,7 @@ const AnthropicSettingsDialog = ({
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
                 >
-                  <p className="rounded-lg border border-destructive p-4">
+                  <p className="rounded-lg border border-destructive p-4 min-w-0 [overflow-wrap:anywhere]">
                     {removeMutation.error?.message}
                   </p>
                 </motion.div>

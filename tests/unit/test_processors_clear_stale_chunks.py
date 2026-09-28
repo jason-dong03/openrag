@@ -72,6 +72,7 @@ def _patch_embedding_pipeline(monkeypatch, chunk_count: int, write_client=None):
     # Embedding model resolution path (config + fallback).
     fake_config = MagicMock()
     fake_config.knowledge.embedding_model = "text-embedding-3-small"
+    fake_config.knowledge.embedding_provider = "openai"
     monkeypatch.setattr(processors_mod, "get_openrag_config", lambda: fake_config)
     monkeypatch.setattr(processors_mod, "get_embedding_model", lambda: "text-embedding-3-small")
     monkeypatch.setattr(processors_mod, "get_index_name", lambda: "test-index")
@@ -314,7 +315,7 @@ async def test_connector_file_id_absent_when_not_provided(monkeypatch):
         Path(tmp_path).unlink(missing_ok=True)
 
     assert len(index_calls) == 1
-    assert index_calls[0]["chunks"][0].metadata == {}
+    assert "connector_file_id" not in index_calls[0]["chunks"][0].metadata
 
 
 def test_document_index_writer_outputs_connector_file_id_when_present():

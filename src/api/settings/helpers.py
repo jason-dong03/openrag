@@ -24,30 +24,88 @@ _LLM_PROVIDER_NAMES = ("openai", "anthropic", "watsonx", "ollama")
 _EMBEDDING_PROVIDER_NAMES = ("openai", "watsonx", "ollama")
 
 
+def _has_other_configured_provider(config, excluding: str) -> bool:
+    """Return True if at least one other provider with embedding support is configured (excluding Anthropic)."""
+    providers = config.providers
+    for key, value in providers.custom.items():
+        if key != excluding and key != "anthropic" and getattr(value, "configured", False):
+            return True
+    if excluding != "openai" and providers.openai.configured:
+        return True
+    if excluding != "watsonx" and providers.watsonx.configured:
+        return True
+    if excluding != "ollama" and providers.ollama.configured:
+        return True
+    return False
+
+
 def _configured_provider_names(config, provider_names) -> list:
     """Return the provider names from `provider_names` marked configured in the OpenRAG config."""
     providers = config.providers
-    return [name for name in provider_names if getattr(providers, name).configured]
+    configured = [name for name in provider_names if getattr(providers, name).configured]
+    from services.model_catalog import catalog
+
+    entries = {entry["key"]: entry for entry in catalog()["providers"]}
+    embedding = tuple(provider_names) == _EMBEDDING_PROVIDER_NAMES
+    for provider, value in providers.custom.items():
+        entry = entries.get(provider)
+        supports_kind = bool(
+            entry and (entry["embedding_models"] if embedding else entry["models"])
+        )
+        if value.configured and supports_kind and provider not in configured:
+            configured.append(provider)
+    return configured
 
 
 def _first_configured_llm_provider(config, excluding: str) -> str:
-    """Return the first configured LLM provider that isn't `excluding`."""
+    """Return the first configured LLM provider that isn't `excluding`.
+
+    Only providers this run mode shows are eligible: falling back to one the
+    config file hides would leave Settings pointing at a provider whose card
+    the user cannot see (see ``config/model_providers.yaml``).
+    """
+    from config.model_providers import visible_provider_keys
+
+    visible = visible_provider_keys()
     for p in _LLM_PROVIDER_NAMES:
-        if p != excluding and getattr(config.providers, p).configured:
+        if p != excluding and p in visible and getattr(config.providers, p).configured:
             return p
+    for provider, value in config.providers.custom.items():
+        if provider != excluding and provider in visible and value.configured:
+            return provider
     return "openai"
 
 
 def _first_configured_embedding_provider(config, excluding: str) -> str:
-    """Return the first configured embedding provider (openai/watsonx/ollama) that isn't `excluding`, or "" if none."""
+    """Return the first configured embedding provider that isn't `excluding`, or "" if none.
+
+    Providers hidden in this run mode are skipped, as in
+    ``_first_configured_llm_provider``.
+    """
+    from config.model_providers import visible_provider_keys
+
+    visible = visible_provider_keys()
     for p in _EMBEDDING_PROVIDER_NAMES:
-        if p != excluding and getattr(config.providers, p).configured:
+        if p != excluding and p in visible and getattr(config.providers, p).configured:
             return p
+    from services.model_catalog import catalog
+
+    entries = {entry["key"]: entry for entry in catalog()["providers"]}
+    for provider, value in config.providers.custom.items():
+        if provider != excluding and provider in visible and value.configured:
+            entry = entries.get(provider)
+            if entry and entry["embedding_models"]:
+                return provider
     return ""
 
 
 def _default_llm_model(provider: str) -> str:
-    """Return the default LLM model for a provider."""
+    """Return the static preferred LLM model for a provider.
+
+    OpenAI/Anthropic have stable preferred defaults. Ollama/watsonx model IDs are
+    dynamic from the live provider list — return empty so the frontend picks from
+    the live list (default flag or first available).
+    """
     from config.model_constants import (
         ANTHROPIC_DEFAULT_LANGUAGE_MODEL,
         OPENAI_DEFAULT_LANGUAGE_MODEL,
@@ -56,20 +114,41 @@ def _default_llm_model(provider: str) -> str:
     return {
         "openai": OPENAI_DEFAULT_LANGUAGE_MODEL,
         "anthropic": ANTHROPIC_DEFAULT_LANGUAGE_MODEL,
-        "watsonx": "ibm/granite-3-8b-instruct",
-        "ollama": "llama3",
+        "watsonx": "",
+        "ollama": "",
     }.get(provider, "")
 
 
 def _default_embedding_model(provider: str) -> str:
-    """Return the default embedding model for a provider."""
-    from config.embedding_constants import OPENAI_DEFAULT_EMBEDDING_MODEL
+    """Return a fallback embedding model for `provider` on provider-removal
+    reshuffle, or "" if none can be assumed safe.
 
-    return {
-        "openai": OPENAI_DEFAULT_EMBEDDING_MODEL,
-        "watsonx": "ibm/granite-embedding-278m-multilingual",
-        "ollama": "nomic-embed-text",
-    }.get(provider, "")
+    No provider gets a hardcoded model name here. A provider name like
+    "openai" or "watsonx" doesn't reliably tell you which models are
+    actually deployed — it's frequently an internal OpenAI/watsonx-
+    compatible gateway with a curated, deployment-specific model subset.
+    A hardcoded guess can silently select a model the gateway doesn't
+    serve, breaking every ingestion with no clear signal why (see
+    incident: hardcoded "text-embedding-3-small" was selected in an
+    environment whose gateway only served "text-embedding-3-large").
+
+    Azure is the exception: its model IDs are customer-defined deployment
+    names, so removal always leaves the model empty for an explicit user
+    choice. For other providers, defer to whatever the deployment declared via
+    EMBEDDING_MODEL/EMBEDDING_PROVIDER (see
+    ``get_declared_default_embedding_model``). If the deployment hasn't
+    declared a default for the provider, return "" and force the admin
+    to pick a model the settings UI confirms is actually available.
+    """
+    # Azure model identifiers are customer-defined deployment names. Even an
+    # operator-declared default may belong to a different workspace/resource,
+    # so provider removal must leave the choice open for the user.
+    if provider == "azure":
+        return ""
+
+    from config.embedding_constants import get_declared_default_embedding_model
+
+    return get_declared_default_embedding_model(provider)
 
 
 async def _affected_embedding_models(

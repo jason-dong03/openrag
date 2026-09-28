@@ -3,13 +3,22 @@
 When a provider is removed and it was the active LLM or embedding provider,
 the backend should fall back to another configured provider AND select a
 sensible default model (not an empty string).
+
+Ollama is the fallback these cases exercise, and a fallback helper will not
+hand back a provider the run mode hides. The module pins a run mode that
+offers Ollama so these stay about fallback selection whatever
+`config/model_providers.yaml` says; `test_model_providers_config` covers the
+hiding itself.
 """
+
+import pytest
 
 from api.settings.helpers import (
     _default_embedding_model,
     _default_llm_model,
     _first_configured_embedding_provider,
     _first_configured_llm_provider,
+    _has_other_configured_provider,
 )
 from config.config_manager import (
     AgentConfig,
@@ -22,7 +31,6 @@ from config.config_manager import (
     ProvidersConfig,
     WatsonXConfig,
 )
-from config.embedding_constants import OPENAI_DEFAULT_EMBEDDING_MODEL
 from config.model_constants import (
     ANTHROPIC_DEFAULT_LANGUAGE_MODEL,
     OPENAI_DEFAULT_LANGUAGE_MODEL,
@@ -31,6 +39,11 @@ from config.model_constants import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _run_mode_that_offers_ollama(monkeypatch):
+    monkeypatch.setenv("OPENRAG_RUN_MODE", "oss")
 
 
 def _make_config(
@@ -90,6 +103,9 @@ class TestDefaultLlmModel:
     def test_watsonx_returns_empty(self):
         assert _default_llm_model("watsonx") == ""
 
+    def test_azure_returns_empty(self):
+        assert _default_llm_model("azure") == ""
+
     def test_unknown_provider_returns_empty(self):
         assert _default_llm_model("nonexistent") == ""
 
@@ -100,8 +116,10 @@ class TestDefaultLlmModel:
 
 
 class TestDefaultEmbeddingModel:
-    def test_openai_returns_static_default(self):
-        assert _default_embedding_model("openai") == OPENAI_DEFAULT_EMBEDDING_MODEL
+    def test_openai_returns_empty(self):
+        """ "openai" often means an internal OpenAI-compatible gateway with a
+        curated model set — never guess, force an explicit, validated pick."""
+        assert _default_embedding_model("openai") == ""
 
     def test_ollama_returns_empty(self):
         assert _default_embedding_model("ollama") == ""
@@ -111,6 +129,32 @@ class TestDefaultEmbeddingModel:
 
     def test_unknown_provider_returns_empty(self):
         assert _default_embedding_model("nonexistent") == ""
+
+    def test_uses_deployment_declared_default_when_set(self, monkeypatch):
+        """When the deployment declares EMBEDDING_MODEL/EMBEDDING_PROVIDER
+        (Helm values / operator ConfigMap), the fallback should use it
+        instead of returning empty — this is what lets a correctly
+        configured deployment self-heal after a provider removal."""
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+        monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-large")
+        assert _default_embedding_model("openai") == "text-embedding-3-large"
+
+    def test_ignores_declared_default_for_a_different_provider(self, monkeypatch):
+        """A declared default for "openai" must not leak into the fallback
+        for a provider it wasn't declared for."""
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+        monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-large")
+        assert _default_embedding_model("watsonx") == ""
+
+    def test_azure_requires_an_explicit_deployment_even_when_env_declares_one(self, monkeypatch):
+        """Azure model names are deployment names chosen by the customer.
+
+        Provider removal must not silently carry an operator default into the
+        user's workspace; both Azure model choices are made explicitly.
+        """
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "azure")
+        monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        assert _default_embedding_model("azure") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +295,9 @@ class TestProviderRemovalEmbeddingDefault:
             config.knowledge.embedding_provider = fb
             config.knowledge.embedding_model = _default_embedding_model(fb)
 
-    def test_remove_ollama_falls_back_to_openai_embedding(self):
+    def test_remove_ollama_falls_back_to_openai_empty_embedding(self):
+        """OpenAI's embedding catalog isn't guessed — the admin must pick
+        one the settings UI confirms is actually available."""
         config = _make_config(
             openai=True,
             ollama=True,
@@ -260,7 +306,7 @@ class TestProviderRemovalEmbeddingDefault:
         )
         self._simulate_embedding_removal(config, "ollama")
         assert config.knowledge.embedding_provider == "openai"
-        assert config.knowledge.embedding_model == OPENAI_DEFAULT_EMBEDDING_MODEL
+        assert config.knowledge.embedding_model == ""
 
     def test_remove_openai_falls_back_to_watsonx_empty_embedding(self):
         config = _make_config(
@@ -273,7 +319,8 @@ class TestProviderRemovalEmbeddingDefault:
         assert config.knowledge.embedding_provider == "watsonx"
         assert config.knowledge.embedding_model == ""
 
-    def test_remove_watsonx_falls_back_to_openai_embedding(self):
+    def test_remove_watsonx_falls_back_to_openai_empty_embedding(self):
+        """Same as above: watsonx -> openai fallback must not guess a model."""
         config = _make_config(
             openai=True,
             watsonx=True,
@@ -282,7 +329,7 @@ class TestProviderRemovalEmbeddingDefault:
         )
         self._simulate_embedding_removal(config, "watsonx")
         assert config.knowledge.embedding_provider == "openai"
-        assert config.knowledge.embedding_model == OPENAI_DEFAULT_EMBEDDING_MODEL
+        assert config.knowledge.embedding_model == ""
 
     def test_no_change_if_different_provider_removed(self):
         config = _make_config(
@@ -294,3 +341,29 @@ class TestProviderRemovalEmbeddingDefault:
         self._simulate_embedding_removal(config, "ollama")
         assert config.knowledge.embedding_provider == "openai"
         assert config.knowledge.embedding_model == "text-embedding-3-small"
+
+
+class TestHasOtherConfiguredProvider:
+    def test_single_provider_cannot_be_removed(self):
+        config = _make_config(watsonx=True)
+        assert not _has_other_configured_provider(config, "watsonx")
+
+    def test_cannot_remove_provider_when_only_anthropic_is_configured(self):
+        config = _make_config(watsonx=True, anthropic=True)
+        assert not _has_other_configured_provider(config, "watsonx")
+
+    def test_can_remove_anthropic_when_watsonx_is_configured(self):
+        config = _make_config(watsonx=True, anthropic=True)
+        assert _has_other_configured_provider(config, "anthropic")
+
+    def test_can_remove_watsonx_when_azure_custom_provider_is_configured(self):
+        from config.config_manager import GenericProviderConfig
+
+        config = _make_config(watsonx=True)
+        config.providers.custom["azure"] = GenericProviderConfig(configured=True)
+        assert _has_other_configured_provider(config, "watsonx")
+        assert _has_other_configured_provider(config, "azure")
+
+    def test_can_remove_watsonx_when_openai_is_configured(self):
+        config = _make_config(watsonx=True, openai=True)
+        assert _has_other_configured_provider(config, "watsonx")

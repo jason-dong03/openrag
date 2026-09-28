@@ -1,12 +1,32 @@
 from typing import Any
 
-from utils.file_utils import clean_connector_filename, get_file_extension
+from opensearchpy.exceptions import NotFoundError
+
+from config.settings import get_index_name
+from utils.file_utils import clean_connector_filename
 from utils.logging_config import get_logger
 
-from .base import BaseConnector, ConnectorDocument
+from .base import (
+    CONTENT_ETAG_METADATA_KEY,
+    BaseConnector,
+    ConnectorDocument,
+    normalize_etag,
+)
 from .connection_manager import ConnectionManager
 
 logger = get_logger(__name__)
+
+
+def _next_page_token(file_list: dict[str, Any]) -> str | None:
+    """Read the continuation token out of a ``list_files`` result.
+
+    Every connector in this repo returns ``next_page_token``; SharePoint is the
+    one that populates it with a real value (a Graph ``$skiptoken``). This used
+    to read ``nextPageToken`` only — a key no connector emits — so the token was
+    always None and paging stopped after the first call. Both spellings are
+    accepted now so a connector written against either convention still pages.
+    """
+    return file_list.get("next_page_token") or file_list.get("nextPageToken")
 
 
 class ConnectorService:
@@ -76,171 +96,6 @@ class ConnectorService:
             return self.session_manager.create_jwt_token(user)
         return self.session_manager.get_effective_jwt_token(user.user_id, effective_token)
 
-    async def process_connector_document(
-        self,
-        document: ConnectorDocument,
-        owner_user_id: str,
-        connector_type: str,
-        jwt_token: str = None,
-        owner_name: str = None,
-        owner_email: str = None,
-        ingest_settings: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Process a document from a connector using active processing pipeline"""
-        jwt_token = await self._get_effective_sync_jwt(owner_user_id, jwt_token)
-
-        from config.settings import DISABLE_INGEST_WITH_LANGFLOW
-
-        if not DISABLE_INGEST_WITH_LANGFLOW and self.langflow_service is not None:
-            # Process via Langflow pipeline
-            from utils.file_utils import langflow_safe_filename_and_mimetype
-
-            langflow_filename, processed_mimetype = langflow_safe_filename_and_mimetype(
-                document.filename, document.mimetype
-            )
-            file_tuple = (langflow_filename, document.content, processed_mimetype)
-
-            allowed_users = []
-            allowed_groups = []
-            allowed_principals = []
-            allowed_principal_labels = []
-            if document.acl:
-                try:
-                    allowed_users = document.acl.allowed_users or []
-                    allowed_groups = document.acl.allowed_groups or []
-                    allowed_principals = document.acl.allowed_principals or []
-                    allowed_principal_labels = document.acl.allowed_principal_labels or []
-                except AttributeError:
-                    pass
-
-            connector_tweak_settings = None
-            if isinstance(ingest_settings, dict):
-                connector_tweak_settings = dict(ingest_settings)
-                connector_tweak_settings.pop("embeddingModel", None)
-
-            tweaks = self.langflow_service.merge_ui_ingest_settings_into_tweaks(
-                {}, connector_tweak_settings
-            )
-
-            result = await self.langflow_service.upload_and_ingest_file(
-                file_tuple=file_tuple,
-                session_id=None,
-                tweaks=tweaks,
-                settings=ingest_settings,
-                jwt_token=jwt_token,
-                owner=owner_user_id,
-                owner_name=owner_name,
-                owner_email=owner_email,
-                connector_type=connector_type,
-                docling_polling_service=self.task_service.docling_polling_service
-                if self.task_service
-                else None,
-                connector_file_id=document.id,
-                source_url=document.source_url,
-                allowed_users=allowed_users,
-                allowed_groups=allowed_groups,
-                allowed_principals=allowed_principals,
-                allowed_principal_labels=allowed_principal_labels,
-                original_filename=document.filename,
-                original_mimetype=document.mimetype,
-            )
-            return {
-                "status": "indexed",
-                "filename": document.filename,
-                "source_url": document.source_url,
-                "document_id": document.id,
-                "connector_type": connector_type,
-                "langflow_result": result,
-            }
-        else:
-            # Create temporary file from document content
-            import os
-
-            from utils.file_utils import auto_cleanup_tempfile
-
-            suffix = os.path.splitext(document.filename)[1]
-            if not suffix:
-                suffix = get_file_extension(document.mimetype)
-
-            with auto_cleanup_tempfile(suffix=suffix) as tmp_path:
-                # Write document content to temp file
-                with open(tmp_path, "wb") as f:
-                    f.write(document.content)
-
-                logger.info(
-                    "[CONNECTOR] Processing document",
-                    document_id=document.id,
-                    connector_type=connector_type,
-                    filename=document.filename,
-                )
-
-                # Process using consolidated processing pipeline
-                from models.processors import TaskProcessor
-
-                processor = TaskProcessor(
-                    document_service=self.document_service,
-                    models_service=self.models_service,
-                    docling_service=self.docling_service,
-                )
-                standard_kwargs: dict[str, Any] = {}
-                if isinstance(ingest_settings, dict):
-                    em = ingest_settings.get("embeddingModel")
-                    if isinstance(em, str) and em.strip():
-                        standard_kwargs["embedding_model"] = em.strip()
-                    for ui_key, param in (
-                        ("chunkSize", "chunk_size"),
-                        ("chunkOverlap", "chunk_overlap"),
-                    ):
-                        raw = ingest_settings.get(ui_key)
-                        if raw is not None:
-                            try:
-                                standard_kwargs[param] = int(raw)
-                            except (TypeError, ValueError):
-                                pass
-                    if "ocr" in ingest_settings:
-                        standard_kwargs["ocr"] = bool(ingest_settings["ocr"])
-                    if "pictureDescriptions" in ingest_settings:
-                        standard_kwargs["picture_descriptions"] = bool(
-                            ingest_settings["pictureDescriptions"]
-                        )
-
-                result = await processor.process_document_standard(
-                    file_path=tmp_path,
-                    file_hash=document.id,
-                    owner_user_id=owner_user_id,
-                    original_filename=document.filename,
-                    jwt_token=jwt_token,
-                    owner_name=owner_name,
-                    owner_email=owner_email,
-                    file_size=len(document.content) if document.content else 0,
-                    connector_type=connector_type,
-                    acl=document.acl,
-                    connector_file_id=document.id,
-                    **standard_kwargs,
-                )
-
-                logger.info(
-                    "[CONNECTOR] Document processed",
-                    document_id=document.id,
-                    status=result.get("status"),
-                )
-
-                # If successfully indexed or already exists, update the indexed documents with connector metadata
-                if result["status"] in ["indexed", "unchanged"]:
-                    # Update all chunks with connector-specific metadata
-                    await self._update_connector_metadata(
-                        document,
-                        owner_user_id,
-                        connector_type,
-                        jwt_token,
-                    )
-
-                return {
-                    **result,
-                    "filename": document.filename,
-                    "source_url": document.source_url,
-                }
-
     async def _update_connector_metadata(
         self,
         document: ConnectorDocument,
@@ -291,7 +146,7 @@ class ConnectorService:
         # used for DLS visibility/ACL-change checks.
         try:
             await write_client.update_by_query(
-                index=self.index_name,
+                index=get_index_name(),
                 body={
                     # Match both fields: both ingestion paths carry the raw
                     # connector id in connector_file_id (document_id is a
@@ -323,6 +178,9 @@ class ConnectorService:
                             if (params.modified_time != null) {
                                 ctx._source.modified_time = params.modified_time;
                             }
+                            if (params.content_etag != null) {
+                                ctx._source.content_etag = params.content_etag;
+                            }
                             if (params.metadata != null) {
                                 ctx._source.metadata = params.metadata;
                             }
@@ -337,6 +195,13 @@ class ConnectorService:
                             "modified_time": document.modified_time.isoformat()
                             if document.modified_time
                             else None,
+                            # Promoted out of metadata to a top-level keyword so
+                            # sync can read it back with a terms aggregation (the
+                            # same shape connector_file_id uses) instead of
+                            # fetching every chunk's _source.
+                            "content_etag": normalize_etag(
+                                (document.metadata or {}).get(CONTENT_ETAG_METADATA_KEY)
+                            ),
                             "metadata": document.metadata,
                         },
                     },
@@ -344,6 +209,23 @@ class ConnectorService:
             )
             logger.debug(f"Updated metadata for document {document.id}")
         except Exception as e:
+            # A missing index means the chunks aren't where this write expects
+            # them (e.g. a residual index-name mismatch, issue 81583). The
+            # document is already indexed; metadata enrichment is best-effort
+            # and re-runs on the next sync, so don't fail the file over it —
+            # matching get_synced_file_ids_for_connector / should_update_acl.
+            if (
+                isinstance(e, NotFoundError)
+                and e.status_code == 404
+                and e.error == "index_not_found_exception"
+            ):
+                logger.warning(
+                    "Skipping connector metadata enrichment — index not found",
+                    document_id=document.id,
+                    index=get_index_name(),
+                    error=str(e),
+                )
+                return
             logger.error(
                 "OpenSearch metadata update failed",
                 document_id=document.id,
@@ -360,7 +242,8 @@ class ConnectorService:
         filename_filter: set = None,
         ingest_settings: dict[str, Any] | None = None,
         replace_duplicates: bool = False,
-        shared: bool = False,
+        shared: bool | None = False,
+        allow_anonymous_delete: bool = True,
     ) -> str:
         """
         Sync files from a connector connection using existing task tracking system.
@@ -405,17 +288,24 @@ class ConnectorService:
         files_to_process: list[dict[str, Any]] = []
         page_token = None
 
-        # Calculate page size to minimize API calls
-        page_size = min(max_files or 100, 1000) if max_files else 100
-
-        while True:
-            # List files from connector with limit
-            logger.debug("Calling list_files", page_size=page_size, page_token=page_token)
-            file_list = await connector.list_files(page_token, max_files=page_size)
+        # A zero cap means "sync nothing" and has to short-circuit before the
+        # first list_files call: every cap below is spelled `if max_files and …`,
+        # so 0 would fall through as "no cap" and enumerate the whole source.
+        # None (no cap) and positive caps take the loop as before.
+        while max_files != 0:
+            # Pass max_files straight through — None means "no cap". Asking for a
+            # synthetic page size instead silently truncated every sync: the
+            # connectors that paginate internally (all three bucket ones, and
+            # Google Drive) honour the cap and then report next_page_token=None,
+            # so there was no token to continue with and everything past the
+            # first page was simply dropped.
+            logger.debug("Calling list_files", max_files=max_files, page_token=page_token)
+            file_list = await connector.list_files(page_token, max_files=max_files)
             logger.debug("Got files from connector", file_count=len(file_list.get("files", [])))
             files = file_list["files"]
+            page_token = _next_page_token(file_list)
 
-            if not files:
+            if not files and not page_token:
                 break
 
             for file_info in files:
@@ -433,12 +323,8 @@ class ConnectorService:
                 files_to_process.append(file_info)
 
             # Stop if we have enough files or no more pages
-            if (max_files and len(files_to_process) >= max_files) or not file_list.get(
-                "nextPageToken"
-            ):
+            if (max_files and len(files_to_process) >= max_files) or not page_token:
                 break
-
-            page_token = file_list.get("nextPageToken")
 
         # Get user information
         user = self.session_manager.get_user(user_id) if self.session_manager else None
@@ -467,6 +353,7 @@ class ConnectorService:
             replace_duplicates=replace_duplicates,
             connector_type=connector.CONNECTOR_TYPE,
             shared=shared,
+            allow_anonymous_delete=allow_anonymous_delete,
         )
 
         # Use file IDs as items (no more fake file paths!)
@@ -499,7 +386,8 @@ class ConnectorService:
         ingest_settings: dict[str, Any] | None = None,
         replace_duplicates: bool = False,
         preview_mode: bool = False,
-        shared: bool = False,
+        shared: bool | None = False,
+        allow_anonymous_delete: bool = True,
     ) -> str:
         """
         Sync specific files by their IDs (used for webhook-triggered syncs or manual selection).
@@ -546,31 +434,23 @@ class ConnectorService:
             connector.set_file_infos(file_infos)
             logger.info(f"Cached {len(file_infos)} file infos with download URLs in connector")
 
-        # Temporarily set file_ids in the connector's config so list_files() can use them
-        # Store the original values to restore later
-        original_file_ids = None
-        original_folder_ids = None
-
-        if hasattr(connector, "cfg"):
-            original_file_ids = getattr(connector.cfg, "file_ids", None)
-            original_folder_ids = getattr(connector.cfg, "folder_ids", None)
-
         expanded_file_ids = file_ids  # Default to original IDs
         expanded_files_info = []
 
         try:
-            # Set the file_ids we want to sync in the connector's config
-            if hasattr(connector, "cfg"):
-                connector.cfg.file_ids = file_ids
-                connector.cfg.folder_ids = None
-
-                # Get the expanded list of file IDs (folders will be expanded to their contents)
-                # This uses the connector's list_files() which calls _iter_selected_items()
-                result = await connector.list_files()
+            # cfg is None on bucket connectors (azure_blob/aws_s3/ibm_cos): they
+            # have no per-call file/folder selection to expand, and file_ids are
+            # already the exact ids to sync. Only cfg-backed connectors
+            # (Google Drive/OneDrive/SharePoint) expand folders here. Guarding on
+            # cfg-is-not-None rather than hasattr is deliberate: BaseConnector
+            # declares cfg=None as a class default, so hasattr is True for every
+            # connector and would route bucket syncs through list_selected_files
+            # -> list_files() (the whole account), discarding the selected ids.
+            if getattr(connector, "cfg", None) is not None:
+                result = await connector.list_selected_files(file_ids)
                 expanded_files = result.get("files", [])
                 expanded_file_ids = [f["id"] for f in expanded_files]
 
-                # Save the expanded files info so we can set correct names in the task UI
                 for f in expanded_files:
                     expanded_files_info.append(f)
 
@@ -601,9 +481,6 @@ class ConnectorService:
                     f"Original IDs: {file_ids}. This may indicate all IDs were folders "
                     f"with no contents, or files that were filtered out."
                 )
-                # If we have file_infos with download URLs, use original file_ids
-                # (OneDrive sharing IDs can't be expanded but can be downloaded directly)
-                # Exclude folders — they have no downloadable content on their own.
                 if file_infos:
                     non_folder_infos = [f for f in file_infos if not f.get("isFolder")]
                     non_folder_ids = [f["id"] for f in non_folder_infos if f.get("id")]
@@ -619,10 +496,8 @@ class ConnectorService:
 
         except Exception as e:
             logger.error(f"Failed to expand file_ids via list_files(): {e}")
-            # Preserve intentional validation failures (e.g., folders-only selection)
             if isinstance(e, ValueError):
                 raise
-            # Fallback path: still exclude known folders when metadata is available
             if file_infos:
                 non_folder_ids = [
                     f["id"] for f in file_infos if f.get("id") and not f.get("isFolder")
@@ -630,11 +505,6 @@ class ConnectorService:
                 expanded_file_ids = non_folder_ids or file_ids
             else:
                 expanded_file_ids = file_ids
-        finally:
-            # Restore original config values
-            if hasattr(connector, "cfg"):
-                connector.cfg.file_ids = original_file_ids
-                connector.cfg.folder_ids = original_folder_ids
 
         # Create custom processor for specific connector files
         from models.processors import ConnectorFileProcessor
@@ -659,6 +529,7 @@ class ConnectorService:
             replace_duplicates=replace_duplicates,
             connector_type=connector.CONNECTOR_TYPE,
             shared=shared,
+            allow_anonymous_delete=allow_anonymous_delete,
         )
 
         # Create custom task using TaskService

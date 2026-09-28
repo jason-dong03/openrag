@@ -1,4 +1,4 @@
-import { ArrowRight, RefreshCw, Search, X } from "lucide-react";
+import { ArrowRight, Download, RefreshCw, Search, X } from "lucide-react";
 import { type ChangeEvent, type FormEvent, useCallback, useState } from "react";
 import { toast } from "sonner";
 import { useRefreshOpenragDocs } from "@/app/api/mutations/useRefreshOpenragDocs";
@@ -7,6 +7,7 @@ import {
   useSyncAllConnectors,
   useSyncAllConnectorsPreview,
 } from "@/app/api/mutations/useSyncConnector";
+import { RequirePermission } from "@/components/require-permission";
 import { Button } from "@/components/ui/button";
 import { useKnowledgeFilter } from "@/contexts/knowledge-filter-context";
 import { cn } from "@/lib/utils";
@@ -132,9 +133,9 @@ export const KnowledgeSearchBar = () => {
             onChange={(e: ChangeEvent<HTMLInputElement>) =>
               setSearchQueryInput(e.target.value)
             }
-            className="h-full w-full bg-transparent text-sm text-[hsl(var(--placeholder))] placeholder:text-[hsl(var(--placeholder))] focus:outline-none focus:ring-0"
+            className="h-full w-full bg-transparent text-sm text-foreground placeholder:text-[hsl(var(--placeholder))] focus:outline-none focus:ring-0"
           />
-          {queryOverride && (
+          {searchQueryInput && (
             <button
               type="button"
               aria-label="Clear search"
@@ -146,7 +147,10 @@ export const KnowledgeSearchBar = () => {
           )}
           <Button
             variant="ghost"
-            className="h-auto rounded-none hover:bg-accent hover:text-foreground p-2 hidden group-focus-within/input:block"
+            className={cn(
+              "h-auto rounded-none hover:bg-accent hover:text-foreground p-2 hidden group-focus-within/input:block",
+              searchQueryInput && "block",
+            )}
             type="submit"
           >
             <ArrowRight className="h-4 w-4 text-[var(--icon-primary)]" />
@@ -166,29 +170,39 @@ export const KnowledgeSearchBar = () => {
         >
           <RefreshCw className="h-4 w-4 m-4 text-[var(--icon-primary)]" />
         </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          disabled={refreshOpenragDocsMutation.isPending}
-          className="h-auto flex-shrink-0 rounded-none px-3 text-sm hover:bg-accent hover:text-foreground"
-          onClick={async () => {
-            try {
-              toast.info("Refreshing OpenRAG docs...");
-              const result = await refreshOpenragDocsMutation.mutateAsync();
-              toast.success(result.message);
-            } catch (error) {
-              toast.error(
-                error instanceof Error
-                  ? error.message
-                  : "Failed to refresh OpenRAG docs",
-              );
+        <RequirePermission perm="config:write">
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={refreshOpenragDocsMutation.isPending}
+            aria-label={
+              refreshOpenragDocsMutation.isPending
+                ? "Refreshing docs..."
+                : "Fetch latest docs"
             }
-          }}
-        >
-          {refreshOpenragDocsMutation.isPending
-            ? "Refreshing docs..."
-            : "Fetch latest docs"}
-        </Button>
+            className="h-auto flex-shrink-0 rounded-none px-3 text-sm hover:bg-accent hover:text-foreground gap-2"
+            onClick={async () => {
+              try {
+                toast.info("Refreshing OpenRAG docs...");
+                const result = await refreshOpenragDocsMutation.mutateAsync();
+                toast.success(result.message);
+              } catch (error) {
+                toast.error(
+                  error instanceof Error
+                    ? error.message
+                    : "Failed to refresh OpenRAG docs",
+                );
+              }
+            }}
+          >
+            <Download className="h-4 w-4 flex-shrink-0" />
+            <span className="hidden lg:inline">
+              {refreshOpenragDocsMutation.isPending
+                ? "Refreshing docs..."
+                : "Fetch latest docs"}
+            </span>
+          </Button>
+        </RequirePermission>
         <div className="ml-auto">
           <KnowledgeDropdown />
         </div>
@@ -202,6 +216,8 @@ export const KnowledgeSearchBar = () => {
         isSyncAll
         orphansByType={syncPreview?.orphans_by_type}
         orphansAvailableByType={syncPreview?.orphans_available_by_type}
+        updatesByType={syncPreview?.updates_by_type}
+        updatesAvailableByType={syncPreview?.updates_available_by_type}
         syncedCountByType={syncPreview?.synced_count_by_type}
       />
     </form>

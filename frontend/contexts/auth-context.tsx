@@ -9,9 +9,10 @@ import React, {
   useState,
 } from "react";
 import { hasRbacPermission } from "@/lib/brand";
+import type { RunMode } from "@/lib/constants";
 import { encodeBase64 } from "@/lib/utils";
 
-interface User {
+export interface User {
   user_id: string;
   email: string;
   name: string;
@@ -28,7 +29,7 @@ interface AuthContextType {
   isAuthenticated: boolean;
   isNoAuthMode: boolean;
   isIbmAuthMode: boolean;
-  runMode: string | null;
+  runMode: RunMode | null;
   version: string | null;
   permissions: Set<string>;
   roles: string[];
@@ -78,7 +79,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [isNoAuthMode, setIsNoAuthMode] = useState(false);
   const [isIbmAuthMode, setIsIbmAuthMode] = useState(false);
   const [version, setVersion] = useState<string | null>(null);
-  const [runMode, setRunMode] = useState<string | null>(null);
+  const [runMode, setRunMode] = useState<RunMode | null>(null);
 
   const checkAuth = useCallback(async () => {
     setIsLoading(true);
@@ -103,6 +104,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       } else if (data.no_auth_mode) {
         setIsNoAuthMode(true);
         setIsIbmAuthMode(false);
+        // No-auth mode is always anonymous — no user identity.
         setUser(null);
       } else if (data.authenticated && data.user) {
         setIsNoAuthMode(false);

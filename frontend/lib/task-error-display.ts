@@ -3,8 +3,33 @@ import type {
   TaskFailurePhase,
   TaskFileEntry,
 } from "@/app/api/queries/useGetTasksQuery";
+import { formatProviderErrorMessage } from "@/lib/chat-stream-errors";
 
 export const FILE_ERROR_MAX_LINE_LENGTH = 80;
+
+/**
+ * Centralized detection for cancelled files.
+ *
+ * Checks failure_phase first (structured data), then falls back to error message strings.
+ * This ensures consistent detection across whole-task cancellation ("Task cancelled by user"),
+ * file-level cancellation ("File cancelled by user"), and API-provided phase markers.
+ */
+export function isFileCancelled(
+  fileInfo: Pick<TaskFileEntry, "failure_phase" | "error">,
+): boolean {
+  // 1. Check structured failure_phase first (most reliable)
+  if (fileInfo.failure_phase === "cancelled") {
+    return true;
+  }
+
+  // 2. Fall back to error message detection for legacy cases
+  const error = fileInfo.error?.toLowerCase() || "";
+  return (
+    error.includes("file cancelled by user") ||
+    error.includes("task cancelled by user") ||
+    error.includes("file processing task cancelled")
+  );
+}
 
 export type TaskErrorComponentCause =
   | "OpenSearch"
@@ -156,19 +181,50 @@ export function resolveTaskFileError(
     typeof fileInfo.result.warning === "string" &&
     fileInfo.result.warning.trim()
   ) {
-    return fileInfo.result.warning.trim();
+    return formatProviderErrorMessage(fileInfo.result.warning.trim());
   }
   if (typeof fileInfo.user_facing_message === "string") {
     const message = fileInfo.user_facing_message.trim();
     if (message) {
-      return message;
+      return formatProviderErrorMessage(message);
     }
   }
   if (typeof fileInfo.error === "string" && fileInfo.error.trim()) {
-    return fileInfo.error.trim();
+    return formatProviderErrorMessage(fileInfo.error.trim());
   }
   if (typeof taskError === "string" && taskError.trim()) {
-    return taskError.trim();
+    return formatProviderErrorMessage(taskError.trim());
+  }
+  return "Unknown error";
+}
+
+/** Best available user-facing reason for a failed ingestion task toast. */
+export function getTaskFailureToastDescription(task: {
+  error?: string | null;
+  failed_files?: number;
+  files?: Record<string, TaskFileEntry> | null;
+}): string {
+  const files = Object.values(task.files ?? {});
+  for (const fileInfo of files) {
+    if (fileInfo.status !== "failed" && fileInfo.status !== "error") {
+      continue;
+    }
+    const message = resolveTaskFileError(fileInfo, task.error ?? undefined);
+    if (message && message !== "Unknown error") {
+      return message;
+    }
+  }
+
+  if (typeof task.error === "string" && task.error.trim()) {
+    return task.error.trim();
+  }
+
+  const failedCount =
+    task.failed_files ??
+    files.filter((file) => file.status === "failed" || file.status === "error")
+      .length;
+  if (failedCount > 0) {
+    return `${failedCount} file${failedCount !== 1 ? "s" : ""} failed`;
   }
   return "Unknown error";
 }
@@ -178,7 +234,13 @@ export function analyzeTaskFileIngestionFailure(
   taskError?: string,
 ): TaskFileIngestionFailureAnalysis {
   const resolvedError = resolveTaskFileError(fileInfo, taskError);
-  const failedStep = normalizeFailurePhase(fileInfo.failure_phase) ?? "unknown";
+
+  // Use centralized cancellation detection
+  const isCancelled = isFileCancelled(fileInfo);
+  const failedStep = isCancelled
+    ? "cancelled"
+    : (normalizeFailurePhase(fileInfo.failure_phase) ?? "unknown");
+
   const pipelineSteps = buildPipelineStepsFromFailurePhase(failedStep);
   const componentCause = formatApiComponent(fileInfo.component);
   const componentTags = componentCause ? [componentCause] : [];

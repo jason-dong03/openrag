@@ -1,60 +1,58 @@
 # syntax=docker/dockerfile:1.4
-# UBI 10 Python 3.14 base image for enterprise compliance
+FROM langflowai/langflow:base-1.12.2
 
-FROM registry.access.redhat.com/ubi10/python-314-minimal AS runtime
+# Install uv, then pre-create the Langflow data directory as root.
+# Langflow 1.12's base image runs as uid=1000, but /app itself is not writable.
+# Upgrade pip first to patch CVE-2026-8643 (fixed in 26.1.2) in the base image.
+RUN pip install --no-cache-dir --upgrade "pip>=26.1.2" \
+    && pip install --no-cache-dir uv
 
-USER 0
+USER root
+RUN mkdir -p /app/langflow-data \
+    && chmod 0777 /app/langflow-data
+USER 1000
 
-# Install runtime system packages and shadow-utils (for groupadd/useradd)
-RUN microdnf install -y \
-    ca-certificates \
-    shadow-utils \
-    && microdnf clean all
-
-# Install Langflow with targeted extras and CPU-only wheels for PyTorch/Docling
-# ibm-watsonx-ai and langchain-ibm are needed because they are not included in the pip installation of langflow when python version is 3.14
 RUN pip install --no-cache-dir \
     --extra-index-url https://download.pytorch.org/whl/cpu \
-    torch==2.10.0 \
-    torchvision==0.25.0 \
-    "langflow-base[docling,openai,anthropic,google,ollama,opensearch,langfuse]==0.9.6" \
+    torch==2.13.0 \
+    torchvision==0.28.0 \
+    "transformers>=5.10.1,<6.0.0" \
+    "docling-core<3.0.0" \
+    "pypdf>=6.16.1,<7.0.0" \
+    openai \
+    langchain-openai \
+    anthropic \
+    langchain-anthropic \
+    google-generativeai \
+    langchain-google-genai \
+    langchain-ollama \
+    opensearch-py \
+    langfuse \
     "ibm-watsonx-ai>=1.3.1,<2.0.0" \
-    "langchain-ibm~=1.1.0" \
-    uv \
-    && pip uninstall -y clickhouse-connect \
-    && pip uninstall -y ragstack-ai-knowledge-store
+    "langchain-ibm~=1.1.0"
 
-# Create a symlink for backwards compatibility with the 'langflow' command
-RUN ln -s /opt/app-root/bin/langflow-base /usr/local/bin/langflow
+COPY flows/ /app/flows/
+COPY custom_components/ /app/custom_components/
 
-# Create application directory and pre-create LANGFLOW_CONFIG_DIR
-WORKDIR /app
-RUN mkdir -p /app/langflow && chown -R 1000:0 /app/langflow && chmod -R g+rwX /app/langflow
-
-# Copy flows with proper ownership from the start to prevent chown duplication
-COPY --chown=root:0 flows/ /app/flows/
-
-# Copy the entrypoint script
+# Switch to root so the entrypoint can correct bind-mount permissions at
+# runtime before dropping back to uid=1000.
 COPY --chmod=755 scripts/langflow-entrypoint.py /usr/local/bin/langflow-entrypoint
+COPY scripts/patch_langflow_openrag_bundle.py /tmp/patch_langflow_openrag_bundle.py
+USER root
+RUN python3 /tmp/patch_langflow_openrag_bundle.py
+ENV LANGFLOW_SSRF_ALLOWED_HOSTS=localhost,127.0.0.1,host.docker.internal
+ENV LANGFLOW_LOG_TRACE_LOCALS=false
+ENV LANGFLOW_LOG_FORMAT=key_value
+ENV LANGFLOW_BLOCK_CODE_INTERPRETER_COMPONENTS=true
+ENV LANGFLOW_COMPONENTS_PATH=/app/custom_components
+ENV LANGFLOW_ALLOW_CUSTOM_COMPONENTS=false
+ENV LANGFLOW_DANGEROUSLY_ALLOW_MULTI_WORKER_WITHOUT_SHARED_QUEUE=true
+ENV LANGFLOW_DISABLE_TRACK_APIKEY_USAGE=true
 
-# Bake env vars into image — covers cases where entrypoint is bypassed
-ENV HOME=/tmp
-ENV XDG_CACHE_HOME=/tmp/.cache
-ENV MEM0_DIR=/tmp/.mem0
-ENV LANGFLOW_CONFIG_DIR=/app/langflow
-ENV GUNICORN_CMD_ARGS="--worker-tmp-dir /tmp"
-ENV LANGFLOW_ALEMBIC_LOG_TO_STDOUT=true
 
-# Set proper ownership for the app directory with OpenShift compatibility
-# Use root group (GID 0) with group-write permissions for OpenShift arbitrary UIDs
-RUN if ! getent passwd 1000 >/dev/null; then \
-        useradd --uid 1000 --gid 0 --home-dir /tmp --no-create-home langflow; \
-    fi \
-    && chgrp -R 0 /app \
-    && chmod -R g+rwX /app
-
-# NOTE: Container runs as root initially so entrypoint can fix permissions
-# The entrypoint script drops to UID 1000 before executing the main process
+# CWE-426 fix: explicitly set PATH so system-owned directories are always resolved
+# first. App venv and ubi python dirs are appended last so they cannot shadow system binaries.
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/app/.venv/bin:/opt/app-root/bin:/opt/app-root/src/bin:/opt/app-root/src/.local/bin
 
 EXPOSE 7860
 

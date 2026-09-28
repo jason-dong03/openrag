@@ -7,13 +7,16 @@ logger = get_logger(__name__)
 async def create_index_body(
     embedding_model: str | None = None,
     embedding_dimensions: int | None = None,
+    *,
+    embedding_provider: str | None = None,
+    embedding_space_id: str | None = None,
 ) -> dict:
     """Create a static index body configuration.
 
     Returns:
         OpenSearch index body configuration
     """
-    from config.embedding_constants import OPENAI_DEFAULT_EMBEDDING_MODEL
+    from config.embedding_constants import get_declared_default_embedding_model
     from config.settings import (
         ACL_PRINCIPAL_LABELS_MAPPING,
         OPENSEARCH_NUMBER_OF_REPLICAS,
@@ -22,10 +25,11 @@ async def create_index_body(
         get_openrag_config,
     )
 
+    config = get_openrag_config()
     resolved_embedding_model = (
         embedding_model
-        or get_openrag_config().knowledge.embedding_model
-        or OPENAI_DEFAULT_EMBEDDING_MODEL
+        or config.knowledge.embedding_model
+        or get_declared_default_embedding_model(config.knowledge.embedding_provider)
     )
 
     properties = {
@@ -39,10 +43,14 @@ async def create_index_body(
         "chunk_embedding": build_knn_vector_field(VECTOR_DIM),
         # Track which embedding model was used for this chunk
         "embedding_model": {"type": "keyword"},
+        "embedding_provider": {"type": "keyword"},
+        "embedding_space_id": {"type": "keyword"},
         "embedding_dimensions": {"type": "integer"},
         "source_url": {"type": "keyword"},
         "connector_type": {"type": "keyword"},
         "ingest_run_id": {"type": "keyword"},
+        # Object-store entity tag of the source file, for sync change detection.
+        "content_etag": {"type": "keyword"},
         "owner": {"type": "keyword"},
         "owner_email": {"type": "keyword"},
         "allowed_users": {"type": "keyword"},
@@ -56,8 +64,13 @@ async def create_index_body(
     }
 
     if embedding_dimensions:
-        properties[get_embedding_field_name(resolved_embedding_model)] = build_knn_vector_field(
-            embedding_dimensions
+        field_identity = embedding_space_id
+        if not field_identity and embedding_provider:
+            from utils.embedding_fields import get_embedding_space_id
+
+            field_identity = get_embedding_space_id(embedding_provider, resolved_embedding_model)
+        properties[get_embedding_field_name(field_identity or resolved_embedding_model)] = (
+            build_knn_vector_field(embedding_dimensions)
         )
 
     return {

@@ -31,9 +31,17 @@ from api import (
     upload,
 )
 from api import keys as api_keys
-from api.health import health_check, opensearch_health_ready
+from api.health import (
+    diagnose_console_component,
+    get_console_component_logs,
+    get_console_status,
+    health_check,
+    opensearch_health_ready,
+    sync_console_component,
+)
 from api.schemas.tasks import ErrorResponse, TaskRetryResponse
 from connectors.registry import get_connector_classes
+from utils.run_mode_utils import is_run_mode_oss
 
 
 def register_internal_routes(app: FastAPI):
@@ -75,7 +83,13 @@ def register_internal_routes(app: FastAPI):
     app.add_api_route("/upload_options", upload.upload_options, methods=["GET"], tags=["internal"])
     app.add_api_route("/upload_bucket", upload.upload_bucket, methods=["POST"], tags=["internal"])
 
-    # Ingest preview endpoint (index proof for preview-mode ingests)
+    # Ingest preview endpoints (Docling layout + index proof for preview-mode ingests)
+    app.add_api_route(
+        "/ingest/preview/{task_id}/docling",
+        ingest_preview.get_parse_preview,
+        methods=["GET"],
+        tags=["internal"],
+    )
     app.add_api_route(
         "/ingest/preview/{task_id}/index-proof",
         ingest_preview.get_index_proof,
@@ -114,6 +128,29 @@ def register_internal_routes(app: FastAPI):
     app.add_api_route(
         "/tasks/{task_id}/cancel",
         tasks.cancel_task,
+        methods=["POST"],
+        tags=["internal"],
+    )
+    app.add_api_route(
+        "/tasks/{task_id}",
+        tasks.delete_task,
+        methods=["DELETE"],
+        tags=["internal"],
+        responses={
+            200: {"model": tasks._DeletedTaskResponse},
+            404: {"model": tasks._TaskNotFoundResponse},
+            409: {"model": tasks._TaskInProgressResponse},
+        },
+    )
+    app.add_api_route(
+        "/tasks",
+        tasks.delete_all_terminal_tasks,
+        methods=["DELETE"],
+        tags=["internal"],
+    )
+    app.add_api_route(
+        "/tasks/{task_id}/files/cancel",
+        tasks.cancel_file,
         methods=["POST"],
         tags=["internal"],
     )
@@ -200,10 +237,16 @@ def register_internal_routes(app: FastAPI):
         tags=["internal"],
     )
 
-    # Session deletion endpoint
+    # Session deletion endpoints
     app.add_api_route(
         "/sessions/{session_id}",
         chat.delete_session_endpoint,
+        methods=["DELETE"],
+        tags=["internal"],
+    )
+    app.add_api_route(
+        "/sessions",
+        chat.bulk_delete_sessions_endpoint,
         methods=["DELETE"],
         tags=["internal"],
     )
@@ -375,6 +418,33 @@ def register_internal_routes(app: FastAPI):
     app.add_api_route("/health", health_check, methods=["GET"], tags=["internal"])
     app.add_api_route("/search/health", opensearch_health_ready, methods=["GET"], tags=["internal"])
 
+    # Console status endpoint (browser session auth — mirrors /v1/status for the UI).
+    # OSS-only: not registered in saas or on_prem deployments.
+    if is_run_mode_oss():
+        app.add_api_route("/status", get_console_status, methods=["GET"], tags=["internal"])
+
+        # Console status endpoints (browser session auth — mirrors /v1/status* for the UI)
+        # The specific /logs sub-route must be registered before the bare /status route.
+        app.add_api_route(
+            "/status/{component}/logs",
+            get_console_component_logs,
+            methods=["GET"],
+            tags=["internal"],
+        )
+        # Per-component actions (#2183): sync re-checks, diagnose explains failures.
+        app.add_api_route(
+            "/status/{component}/sync",
+            sync_console_component,
+            methods=["POST"],
+            tags=["internal"],
+        )
+        app.add_api_route(
+            "/status/{component}/diagnose",
+            diagnose_console_component,
+            methods=["GET"],
+            tags=["internal"],
+        )
+
     # Models endpoints
     app.add_api_route(
         "/models/openai", models.get_openai_models, methods=["POST"], tags=["internal"]
@@ -389,6 +459,18 @@ def register_internal_routes(app: FastAPI):
         "/models/ollama", models.get_ollama_models, methods=["GET"], tags=["internal"]
     )
     app.add_api_route("/models/ibm", models.get_ibm_models, methods=["POST"], tags=["internal"])
+    app.add_api_route(
+        "/models/watsonx_onprem/spaces",
+        models.get_watsonx_onprem_spaces,
+        methods=["POST"],
+        tags=["internal"],
+    )
+    app.add_api_route(
+        "/models/catalog", models.get_model_catalog, methods=["GET"], tags=["internal"]
+    )
+    app.add_api_route(
+        "/models/providers", models.get_model_providers, methods=["GET"], tags=["internal"]
+    )
 
     # Onboarding endpoints
     app.add_api_route("/onboarding", settings.onboarding, methods=["POST"], tags=["internal"])
@@ -422,6 +504,26 @@ def register_internal_routes(app: FastAPI):
     app.add_api_route(
         "/reset-flow/{flow_type}",
         flows.reset_flow_endpoint,
+        methods=["POST"],
+        tags=["internal"],
+    )
+
+    # Flow updates endpoints
+    app.add_api_route(
+        "/settings/flows/updates-available",
+        flows.get_flows_updates_endpoint,
+        methods=["GET"],
+        tags=["internal"],
+    )
+    app.add_api_route(
+        "/settings/flows/update",
+        flows.bulk_update_flows_endpoint,
+        methods=["POST"],
+        tags=["internal"],
+    )
+    app.add_api_route(
+        "/settings/flows/dismiss-update",
+        flows.dismiss_flows_update_endpoint,
         methods=["POST"],
         tags=["internal"],
     )
