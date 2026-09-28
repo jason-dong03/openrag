@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: pr-2371
+          ref: main
           token: ${{ secrets.UPSTREAM_UPDATE_TOKEN || github.token }}
 
       - uses: actions/setup-python@v7
