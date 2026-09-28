@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   propose:
-    if: github.repository == 'langflow-ai/openrag'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -22,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: pr-2371
           token: ${{ secrets.UPSTREAM_UPDATE_TOKEN || github.token }}
 
       - uses: actions/setup-python@v7
